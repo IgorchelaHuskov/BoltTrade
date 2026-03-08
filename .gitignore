@@ -8,3 +8,6 @@ build/
 
 # Системные файлы macOS
 .DS_Store
+
+# Configs
+APIConfig.json
