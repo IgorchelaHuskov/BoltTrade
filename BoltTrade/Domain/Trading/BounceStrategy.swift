@@ -215,36 +215,31 @@ actor BounceStrategy: TradingStrategy, Resettable {
         
         // 2. ПРОВЕРКА РОДНОГО КЛАСТЕРА (Защита тыла)
         if let myCluster = snapshot.clusters.first(where: { $0.trackingId == position.sourceClusterId }) {
-            let isHealthy = await checkLevelHealth(cluster: myCluster, snapshot: snapshot, initialVol: position.initialVolume)
+            // Мы проверяем СВОЙ уровень (isObstacle: false)
+            let isHealthy = await checkLevelHealth(cluster: myCluster, snapshot: snapshot, initialVol: position.initialVolume, isObstacle: false)
+            
             if !isHealthy {
-                print("🧨 [BACKSTAB] Наш защитный уровень ослаб. Закрываемся.")
-                await reset()
-                return .exit
+                print("🧨 [BACKSTAB] Наша защита пала. Закрываемся поцене \(price), чтобы не получить стоп.")
+                await reset(); return .exit
             }
         }
         
         // 3. ПРОВЕРКА ВСТРЕЧНЫХ КЛАСТЕРОВ (Анализ препятствий)
         if let obstacle = findSignificantObstacle(price: price, snapshot: snapshot, side: position.side) {
-            let isObstacleStrong = await checkLevelHealth(cluster: obstacle, snapshot: snapshot, initialVol: findCurrentVolume(cluster: obstacle, book: snapshot.book))
+            // Мы проверяем ЧУЖОЙ уровень (isObstacle: true)
+            let isObstacleStrong = await checkLevelHealth(cluster: obstacle, snapshot: snapshot, initialVol: findCurrentVolume(cluster: obstacle, book: snapshot.book), isObstacle: true)
+            
+            // ВНИМАНИЕ: Если встречный уровень КРЕПКИЙ (true) — мы ВЫХОДИМ (фиксим профит)
             if isObstacleStrong {
-                print("🧱 [WALL] Уперлись в сильный встречный уровень. Фиксируем профит. Закрытие по цене \(price)")
-                await reset()
-                return .exit
+                print("🧱 [WALL] Впереди бетонная стена. Фиксируем профит и выходим по цене \(price).")
+                await reset(); return .exit
+            } else {
+                // Если он слабый (false) — мы просто идем дальше (nil), не выходим!
+                print("🍴 [EATING] Впереди препятствие, но мы его прогрызаем. Держим!")
             }
         }
         
-        // 3. Проверка TAKE PROFIT (цель 4%)
-        let targetPrice = (side == .bid) ? position.entryPrice * 1.04 : position.entryPrice * 0.96
-        let isTargetHit = (side == .bid && price >= targetPrice) ||
-                          (side == .ask && price <= targetPrice)
-        
-        if isTargetHit {
-            print("💰 [TAKE PROFIT] Цель достигнута! Цена: \(price). Профит зафиксирован.")
-            await reset()
-            return .exit
-        }
-        
-        // 3. Лог состояния (не чаще раза в минуту, чтобы не спамить)
+        // 4. Лог состояния (не чаще раза в минуту, чтобы не спамить)
         // Тут можно добавить вывод текущего профита в %
         
         return nil
@@ -276,35 +271,39 @@ actor BounceStrategy: TradingStrategy, Resettable {
 
     
     // Метод только для ПРОВЕРКИ уже открытой позиции (Выход)
-    private func checkLevelHealth(cluster: Cluster, snapshot: MarketSnapshot, initialVol: Double) async -> Bool {
+    private func checkLevelHealth(cluster: Cluster, snapshot: MarketSnapshot, initialVol: Double, isObstacle: Bool) async -> Bool {
         let price = snapshot.currentPrice
         
-        // 1. Пробой - сразу FALSE (выходим)
+        // 1. Пробой (физическое пересечение ценой)
         let isBroken = (cluster.side == .bid && price < cluster.lowerBound) ||
                        (cluster.side == .ask && price > cluster.upperBound)
+        
         if isBroken {
-            print("Уровень пробит!!! Выходим из рынка")
+            // Если пробит НАШ уровень — это плохо (false).
+            // Если пробит ВСТРЕЧНЫЙ — это отлично, мы летим дальше, значит препятствия больше нет (тоже false).
             return false
         }
         
-        // 2. Объем (без пауз, если рухнул - выходим)
+        // 2. Проверка объема
         let currentVol = findCurrentVolume(cluster: cluster, book: snapshot.book)
-        if (currentVol / initialVol) < 0.4 {
-            print("Объем рухнул до \(Int((currentVol / initialVol) * 100))% Выходим из рынка")
+        let isVolumeLow = (currentVol / initialVol) < 0.4
+        
+        // 3. Проверка битвы (агрессоры vs лимиты)
+        var isBattleLost = false
+        if let stats = snapshot.battleStats[cluster.trackingId] {
+            let battleResult = await checkBattleConditions(stats: stats, cluster: cluster, book: snapshot.book, initialVolume: initialVol)
+            isBattleLost = (battleResult == false)
+        }
+
+        // ЛОГИКА ВЫВОДА:
+        if isVolumeLow || isBattleLost {
+            // Уровень истощен.
+            // Если это КЛАСТЕР-ПРЕПЯТСТВИЕ, возвращаем false (он нам не страшен, не выходим).
+            // Если это НАШ КЛАСТЕР, возвращаем false (защита пала, выходим).
             return false
         }
         
-        // 3. Битва (если есть данные)
-        if let stats = snapshot.battleStats[cluster.trackingId] {
-            // Если битва проиграна - FALSE
-            let battleResult = await checkBattleConditions(stats: stats, cluster: cluster, book: snapshot.book, initialVolume: initialVol)
-            if battleResult == false {
-                print("БИТВА ПРОИГРАНА: Агрессоры сильнее лимитов. Выходим из рынка.")
-                return false
-            }
-        }
-        
-        return true // Уровень всё еще живой
+        return true // Уровень стоит крепко
     }
 
     
