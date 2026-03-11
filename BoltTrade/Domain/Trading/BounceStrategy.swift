@@ -33,8 +33,10 @@ actor BounceStrategy: TradingStrategy, Resettable {
     
     struct Position {
         let entryPrice: Double
-        var stopLoss: Double
+        let sourceClusterId: Double
+        let initialVolume: Double
         let side: Side
+        var stopLoss: Double
     }
     
     enum StrategyState {
@@ -147,13 +149,20 @@ actor BounceStrategy: TradingStrategy, Resettable {
             return nil
         }
         
+        // 6. Защита от спуфинга (Volatility Spike)
+        guard await noVolatilitySpike(currentCluster: cluster, price: snapshot.currentPrice, book: snapshot.book) else {
+            print("⚠️ [\(cluster.trackingId)] Обнаружен всплеск волатильности (спуфинг). Отмена.")
+            await reset()
+            return nil
+        }
+        
         // 7. Анализ БИТВЫ
         guard let battleStats = snapshot.battleStats[cluster.trackingId] else {
             print("⚔️ [\(cluster.trackingId)] Ждем первых рыночных ударов в кластер...")
             return nil
         }
         
-        let battleResult = await checkBattleConditions(stats: battleStats, cluster: cluster, book: snapshot.book, context: context)
+        let battleResult = await checkBattleConditions(stats: battleStats, cluster: cluster, book: snapshot.book, initialVolume: context.initialVolume)
         
         if battleResult == false {
             print("🚩 [\(cluster.trackingId)] БИТВА ПРОИГРАНА: Агрессоры сильнее лимитов. Отмена.")
@@ -170,7 +179,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
                          (cluster.side == .ask && price < cluster.lowerBound)
         
         if isBouncing {
-            let position = updatePosition(cluster: cluster, price: price)
+            let position = updatePosition(cluster: cluster, price: price, context: context)
             let now = Date()
             let timeString = now.formatted(date: .omitted, time: .standard) // Результат: 14:30:15
             print("""
@@ -204,7 +213,17 @@ actor BounceStrategy: TradingStrategy, Resettable {
             return .exit
         }
         
-        // 2. Проверка TAKE PROFIT (цель 4%)
+        // 2. ПРОВЕРКА РОДНОГО КЛАСТЕРА (Защита тыла)
+        if let myCluster = snapshot.clusters.first(where: { $0.trackingId == position.sourceClusterId }) {
+            let isHealthy = await checkLevelHealth(cluster: myCluster, snapshot: snapshot, initialVol: position.initialVolume)
+            if !isHealthy {
+                print("🧨 [BACKSTAB] Наш защитный уровень ослаб. Закрываемся.")
+                await reset()
+                return .exit
+            }
+        }
+        
+        // 3. Проверка TAKE PROFIT (цель 4%)
         let targetPrice = (side == .bid) ? position.entryPrice * 1.04 : position.entryPrice * 0.96
         let isTargetHit = (side == .bid && price >= targetPrice) ||
                           (side == .ask && price <= targetPrice)
@@ -222,14 +241,53 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     
-    // MARK: Вспомогательные методы scaning-monitoring
-    private func updatePosition(cluster: Cluster, price: Double) -> Position {
+    // MARK: Вспомогательные методы scaning-monitoring-position
+    
+    // Метод только для ПРОВЕРКИ уже открытой позиции (Выход)
+    private func checkLevelHealth(cluster: Cluster, snapshot: MarketSnapshot, initialVol: Double) async -> Bool {
+        let price = snapshot.currentPrice
+        
+        // 1. Пробой - сразу FALSE (выходим)
+        let isBroken = (cluster.side == .bid && price < cluster.lowerBound) ||
+                       (cluster.side == .ask && price > cluster.upperBound)
+        if isBroken {
+            print("Уровень пробит!!! Выходим из рынка")
+            return false
+        }
+        
+        // 2. Объем (без пауз, если рухнул - выходим)
+        let currentVol = findCurrentVolume(cluster: cluster, book: snapshot.book)
+        if (currentVol / initialVol) < 0.4 {
+            print("Объем рухнул до \(Int((currentVol / initialVol) * 100))% Выходим из рынка")
+            return false
+        }
+        
+        // 3. Битва (если есть данные)
+        if let stats = snapshot.battleStats[cluster.trackingId] {
+            // Если битва проиграна - FALSE
+            let battleResult = await checkBattleConditions(stats: stats, cluster: cluster, book: snapshot.book, initialVolume: initialVol)
+            if battleResult == false {
+                print("БИТВА ПРОИГРАНА: Агрессоры сильнее лимитов. Выходим из рынка.")
+                return false
+            }
+        }
+        
+        return true // Уровень всё еще живой
+    }
+
+    
+    private func updatePosition(cluster: Cluster, price: Double, context: MonitoringContext) -> Position {
         let offset = price * 0.001 // Тот самый 0.1% "запас" на шум
 
         let stopLoss = (cluster.side == .bid)
             ? (cluster.lowerBound - offset) // Для Лонга: ниже нижней границы
             : (cluster.upperBound + offset) // Для Шорта: выше верхней границы
-        return Position(entryPrice: price, stopLoss: stopLoss, side: cluster.side)
+        return Position(entryPrice: price,
+                        sourceClusterId: cluster.trackingId,
+                        initialVolume: context.initialVolume,
+                        side: cluster.side,
+                        stopLoss: stopLoss
+        )
     }
     
 
@@ -313,7 +371,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     
-    private func checkBattleConditions(stats: LevelBattleStats, cluster: Cluster, book: LocalOrderBook, context: MonitoringContext) async -> Bool? {
+    private func checkBattleConditions(stats: LevelBattleStats, cluster: Cluster, book: LocalOrderBook, initialVolume: Double) async -> Bool? {
         let attackerVol = stats.attackerVolume
         let defenderVolume = stats.defenderVolume
         let currentLimit = findCurrentVolume(cluster: cluster, book: book)
@@ -327,7 +385,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         }
         
         // Абсолютный минимум лимитов (чтобы не заходить в пустой стакан)
-        let minRequiredLimit = context.initialVolume * 0.3 // Хотя бы 30% от начальной плиты должно остаться
+        let minRequiredLimit = initialVolume * 0.3 // Хотя бы 30% от начальной плиты должно остаться
         if currentLimit < minRequiredLimit {
             print("🚩 Лимиты истощены (осталось < 30%). Риск проскальзывания слишком высок.")
             return false
@@ -362,87 +420,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
         }
         
         return true
-    }
-    
-    
-    private func calculateRR(currentCluster: Cluster, allClusters: [Cluster]) -> (ratio: Double, target: Double, stop: Double)? {
-        let isBid = currentCluster.side == .bid
-        let direction = isBid ? 1.0 : -1.0
-        
-        // 1. Точка входа: край кластера, с которого заходит цена
-        let entryPrice = isBid ? currentCluster.upperBound : currentCluster.lowerBound
-        
-        // 2. СТОП-ЛОСС:
-        // Поскольку binSize "живой" и обучен на волатильности, мы можем доверять ему.
-        // Ставим стоп за противоположный край + 15-20% от размера самого бина.
-        // Если рынок волатильный -> бин большой -> стоп автоматически станет шире.
-        let stopPadding = currentCluster.binSize * 0.2
-        let stopPrice = isBid ? (currentCluster.lowerBound - stopPadding) : (currentCluster.upperBound + stopPadding)
-        
-        // 3. ЦЕЛЬ (Target):
-        // Ищем следующий сильный кластер, но пропускаем "шум" (минимум 2-3 живых бина от нас)
-        let minDistance = currentCluster.binSize * 2.5
-        
-        let targetCluster = allClusters.first { cluster in
-            let distance = (cluster.price - entryPrice) * direction
-            return distance > minDistance
-        }
-        
-        // Если впереди пусто, берем консервативную цель (например, 5 "живых" бинов)
-        let finalTargetPrice: Double
-        if let target = targetCluster {
-            finalTargetPrice = target.price
-        } else {
-            finalTargetPrice = entryPrice + (direction * currentCluster.binSize * 5.0)
-        }
-        
-        // 4. РАСЧЕТ RATIO
-        let risk = abs(entryPrice - stopPrice)
-        let reward = abs(finalTargetPrice - entryPrice)
-        
-        guard risk > 0 else { return nil }
-        let ratio = reward / risk
-        
-        return (ratio, finalTargetPrice, stopPrice)
-    }
-
-    
-    private func isPatternConfirming(pattern: CandlePattern, side: Side, state: MarketStateAnalyzer.MarketState) -> Bool {
-        switch side {
-        case .bid:  // Покупаем (отскок от поддержки вверх)
-            switch pattern {
-            case .bullish, .engulfing:
-                print("✅ Бычий паттерн для покупки")
-                return true
-            case .longWick:
-                print("✅ Длинная тень - возможный разворот")
-                return true
-            case .doji:
-                let allowed = (state == .strongUptrend || state == .weakUptrend)
-                print("⚠️ Доджи \(allowed ? "разрешён" : "НЕ разрешён") при \(state)")
-                return allowed
-            case .bearish:
-                print("❌ Медвежий паттерн против покупки")
-                return false
-            }
-            
-        case .ask:  // Продаём (отскок от сопротивления вниз)
-            switch pattern {
-            case .bearish, .engulfing:
-                print("✅ Медвежий паттерн для продажи")
-                return true
-            case .longWick:
-                print("✅ Длинная тень - возможный разворот")
-                return true
-            case .doji:
-                let allowed = (state == .strongDowntrend || state == .weakDowntrend)
-                print("⚠️ Доджи \(allowed ? "разрешён" : "НЕ разрешён") при \(state)")
-                return allowed
-            case .bullish:
-                print("❌ Бычий паттерн против продажи")
-                return false
-            }
-        }
     }
     
     
