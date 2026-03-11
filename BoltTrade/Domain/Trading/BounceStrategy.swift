@@ -223,6 +223,16 @@ actor BounceStrategy: TradingStrategy, Resettable {
             }
         }
         
+        // 3. ПРОВЕРКА ВСТРЕЧНЫХ КЛАСТЕРОВ (Анализ препятствий)
+        if let obstacle = findSignificantObstacle(price: price, snapshot: snapshot, side: position.side) {
+            let isObstacleStrong = await checkLevelHealth(cluster: obstacle, snapshot: snapshot, initialVol: findCurrentVolume(cluster: obstacle, book: snapshot.book))
+            if isObstacleStrong {
+                print("🧱 [WALL] Уперлись в сильный встречный уровень. Фиксируем профит. Закрытие по цене \(price)")
+                await reset()
+                return .exit
+            }
+        }
+        
         // 3. Проверка TAKE PROFIT (цель 4%)
         let targetPrice = (side == .bid) ? position.entryPrice * 1.04 : position.entryPrice * 0.96
         let isTargetHit = (side == .bid && price >= targetPrice) ||
@@ -242,6 +252,28 @@ actor BounceStrategy: TradingStrategy, Resettable {
     
     
     // MARK: Вспомогательные методы scaning-monitoring-position
+    
+    // Метод для ПОИСКА встречных кластеров
+    private func findSignificantObstacle(price: Double, snapshot: MarketSnapshot, side: Side) -> Cluster? {
+        let targetSide: Side = (side == .bid) ? .ask : .bid
+        
+        return snapshot.clusters
+            .filter { cluster in
+                // 1. Направление (только то, что впереди по ходу движения)
+                let isAhead = (side == .bid) ? (cluster.lowerBound > price) : (cluster.upperBound < price)
+                let isOppositeSide = cluster.side == targetSide
+                
+                // 2. Фильтр "значимости" (чтобы не выходить об мелкие плотности)
+                // Уровень должен иметь вес (Z-Score) или быть достаточно крупным относительно среднего
+                let isSignificant = cluster.strengthZScore > 2.5
+                
+                return isAhead && isOppositeSide && isSignificant
+            }
+            // Сортируем по близости к текущей цене
+            .sorted { (side == .bid) ? ($0.lowerBound < $1.lowerBound) : ($0.upperBound > $1.upperBound) }
+            .first
+    }
+
     
     // Метод только для ПРОВЕРКИ уже открытой позиции (Выход)
     private func checkLevelHealth(cluster: Cluster, snapshot: MarketSnapshot, initialVol: Double) async -> Bool {
