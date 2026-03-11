@@ -30,10 +30,17 @@ actor BounceStrategy: TradingStrategy, Resettable {
         var hasTouched: Bool = false
     }
     
+    
+    struct Position {
+        let entryPrice: Double
+        var stopLoss: Double
+        let side: Side
+    }
+    
     enum StrategyState {
         case scanning
         case monitoring(MonitoringContext)
-        case positionOpen(entryPrice: Double)
+        case positionOpen(Position)
     }
     
     // MARK: - Свойства
@@ -49,8 +56,8 @@ actor BounceStrategy: TradingStrategy, Resettable {
         case .monitoring(let monitoringContext):
             return await handleMonitoring(context: monitoringContext, snapshot: marketSnapshot)
             
-        case .positionOpen(let entryPrice):
-            return await handlePositionOpen(entryPrice: entryPrice)
+        case .positionOpen(let position):
+            return await handlePositionOpen(position: position, snapshot: marketSnapshot)
         }
     }
     
@@ -163,14 +170,17 @@ actor BounceStrategy: TradingStrategy, Resettable {
                          (cluster.side == .ask && price < cluster.lowerBound)
         
         if isBouncing {
+            let position = updatePosition(cluster: cluster, price: price)
+            let now = Date()
+            let timeString = now.formatted(date: .omitted, time: .standard) // Результат: 14:30:15
             print("""
             🚀🚀🚀 [\(cluster.trackingId)] СИГНАЛ СФОРМИРОВАН!
             Сторона: \(cluster.side)
-            Цена входа: \(price)
+            Позиция открыта по цене \(position.entryPrice) в \(timeString)
             Итоговый объем кластера: \(currentVol)
             Объем поглощенной атаки: \(battleStats.attackerVolume)
             """)
-            state = .positionOpen(entryPrice: price)
+            state = .positionOpen(position)
             return (cluster.side == .bid) ? .buy : .sell
         } else {
             print("🛡️ [\(cluster.trackingId)] Лимиты устояли! Ждем выхода цены из зоны для входа...")
@@ -180,18 +190,49 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
 
     
-    private func handlePositionOpen(entryPrice: Double) async -> Signal? {
-        let now = Date()
-        let timeString = now.formatted(date: .omitted, time: .standard) // Результат: 14:30:15
-        print("📈 Позиция открыта по цене \(entryPrice) в \(timeString)")
+    private func handlePositionOpen(position: Position, snapshot: MarketSnapshot) async -> Signal? {
+        let price = snapshot.currentPrice
+        let side = position.side // Нам нужно знать, лонг это или шорт (можно добавить в Position)
         
+        // 1. Проверка STOP LOSS (цена пересекла линию)
+        let isStopHit = (side == .bid && price <= position.stopLoss) ||
+                        (side == .ask && price >= position.stopLoss)
         
-        await reset()
+        if isStopHit {
+            print("🛑 [STOP LOSS] Позиция закрыта по цене \(price). Убыток зафиксирован.")
+            await reset()
+            return .exit
+        }
+        
+        // 2. Проверка TAKE PROFIT (цель 4%)
+        let targetPrice = (side == .bid) ? position.entryPrice * 1.04 : position.entryPrice * 0.96
+        let isTargetHit = (side == .bid && price >= targetPrice) ||
+                          (side == .ask && price <= targetPrice)
+        
+        if isTargetHit {
+            print("💰 [TAKE PROFIT] Цель достигнута! Цена: \(price). Профит зафиксирован.")
+            await reset()
+            return .exit
+        }
+        
+        // 3. Лог состояния (не чаще раза в минуту, чтобы не спамить)
+        // Тут можно добавить вывод текущего профита в %
+        
         return nil
     }
     
     
     // MARK: Вспомогательные методы scaning-monitoring
+    private func updatePosition(cluster: Cluster, price: Double) -> Position {
+        let offset = price * 0.001 // Тот самый 0.1% "запас" на шум
+
+        let stopLoss = (cluster.side == .bid)
+            ? (cluster.lowerBound - offset) // Для Лонга: ниже нижней границы
+            : (cluster.upperBound + offset) // Для Шорта: выше верхней границы
+        return Position(entryPrice: price, stopLoss: stopLoss, side: cluster.side)
+    }
+    
+
     private func findTargetCluster(in snapshot: MarketSnapshot) -> Cluster? {
         let currentPrice = snapshot.currentPrice
         return snapshot.clusters
