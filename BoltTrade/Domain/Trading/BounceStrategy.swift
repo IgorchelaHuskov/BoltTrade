@@ -30,6 +30,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         var hasTouched: Bool = false
     }
     
+    
     struct Position {
         let entryPrice: Double
         let sourceClusterId: Double
@@ -38,21 +39,10 @@ actor BounceStrategy: TradingStrategy, Resettable {
         var stopLoss: Double
     }
     
-    struct ObstacleInfo {
-        let cluster: Cluster
-        let initialVolume: Double
-        let detectedAt: Date
-    }
-    
     enum StrategyState {
         case scanning
         case monitoring(MonitoringContext)
         case positionOpen(Position)
-    }
-    
-    enum ObstacleAction {
-        case toBeBroken   // Должны пробить
-        case toBeBounced  // Должен быть отскок
     }
     
     // MARK: - Свойства
@@ -215,7 +205,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         
         // 1. Проверка STOP LOSS (цена пересекла линию)
         let isStopHit = (side == .bid && price <= position.stopLoss) ||
-        (side == .ask && price >= position.stopLoss)
+                        (side == .ask && price >= position.stopLoss)
         
         if isStopHit {
             print("🛑 [STOP LOSS] Позиция закрыта по цене \(price). Убыток зафиксирован.")
@@ -223,165 +213,66 @@ actor BounceStrategy: TradingStrategy, Resettable {
             return .exit
         }
         
-        // 2. ПРОВЕРКА РОДНОГО КЛАСТЕРА (всегда проверяем - не пробит ли наш уровень) ВОЗМОЖНО ДОБАВИТЬ ПРОВЕРКУ НА ЛОЖНОЕ ПРОБИТИЕ
+        // 2. ПРОВЕРКА РОДНОГО КЛАСТЕРА (Защита тыла)
         if let myCluster = snapshot.clusters.first(where: { $0.trackingId == position.sourceClusterId }) {
-            let isMyClusterBroken = (position.side == .bid && price < myCluster.lowerBound) ||
-            (position.side == .ask && price > myCluster.upperBound)
-            
-            if isMyClusterBroken {
-                print("🧨 [BACKSTAB] Наш уровень пробит! Закрываемся по цене \(price)")
+            let isHealthy = await checkLevelHealth(cluster: myCluster, snapshot: snapshot, initialVol: position.initialVolume)
+            if !isHealthy {
+                print("🧨 [BACKSTAB] Наш защитный уровень ослаб. Закрываемся.")
                 await reset()
                 return .exit
             }
         }
         
-        // 3. ПРОВЕРКА ВСТРЕЧНЫХ КЛАСТЕРОВ (Анализ препятствий)
-        if let obstacle = findSignificantObstacle(price: price, snapshot: snapshot, position: position) {
-            
-            let obstacleType = determineObstacleType(obstacle: obstacle, position: position)
-            
-            switch obstacleType {
-            case .toBeBroken: // Должны ПРОБИТЬ этот кластер
-                let willBreak = await willBreakThrough(obstacle: obstacle, snapshot: snapshot)
-                if willBreak {
-                    print("💪 [BREAKING] Кластер \(obstacle.trackingId) будет пробит. Держим позицию!")
-                    return nil
-                } else {
-                    print("🧱 [WALL] Кластер \(obstacle.trackingId) НЕ пробить. Выходим в профит!")
-                    await reset()
-                    return .exit
-                }
-                
-            case .toBeBounced: // Должен быть ОТСКОК от этого кластера
-                let willBounce = await willBounceFrom(obstacle: obstacle, snapshot: snapshot)
-                if willBounce {
-                    print("🔄 [BOUNCE] Отскок от кластера \(obstacle.trackingId). Держим позицию!")
-                    return nil
-                } else {
-                    print("💥 [BREAK] Кластер \(obstacle.trackingId) будет пробит, а не отскок. Выходим!")
-                    await reset()
-                    return .exit
-                }
-            }
+        // 3. Проверка TAKE PROFIT (цель 4%)
+        let targetPrice = (side == .bid) ? position.entryPrice * 1.04 : position.entryPrice * 0.96
+        let isTargetHit = (side == .bid && price >= targetPrice) ||
+                          (side == .ask && price <= targetPrice)
+        
+        if isTargetHit {
+            print("💰 [TAKE PROFIT] Цель достигнута! Цена: \(price). Профит зафиксирован.")
+            await reset()
+            return .exit
         }
         
-        // 4. Нет препятствий - продолжаем движение
-        print("➡️ [CLEAR] Путь свободен. Держим позицию!")
+        // 3. Лог состояния (не чаще раза в минуту, чтобы не спамить)
+        // Тут можно добавить вывод текущего профита в %
+        
         return nil
     }
     
     
     // MARK: Вспомогательные методы scaning-monitoring-position
     
-    // Метод для ПОИСКА встречных кластеров
-    private func findSignificantObstacle(price: Double, snapshot: MarketSnapshot, position: Position) -> Cluster? {
-        let isMovingUp = (position.side == .bid)
+    // Метод только для ПРОВЕРКИ уже открытой позиции (Выход)
+    private func checkLevelHealth(cluster: Cluster, snapshot: MarketSnapshot, initialVol: Double) async -> Bool {
+        let price = snapshot.currentPrice
         
-        return snapshot.clusters
-            .filter { cluster in
-                // 1. Игнорируем свой кластер
-                guard cluster.trackingId != position.sourceClusterId else { return false }
-                
-                // 2. Направление (только то, что впереди по ходу движения)
-                let isAhead: Bool
-                if isMovingUp {
-                    isAhead = cluster.lowerBound > price // Выше текущей цены
-                } else {
-                    isAhead = cluster.upperBound < price // Ниже текущей цены
-                }
-                
-                // 3. Фильтр "значимости" (чтобы не выходить об мелкие плотности)
-                let isSignificant = cluster.strengthZScore > 4.5
-                
-                // 4. Дать цене отплыть на минимальнаю дистанцию
-                let distance: Double
-                if isMovingUp {
-                    // В лонге смотрим вверх на ask: дистанция от цены до низа кластера
-                    distance = abs(cluster.lowerBound - price) / price
-                } else {
-                    // В шорте смотрим вниз на bid: дистанция от цены до верха кластера
-                    distance = abs(price - cluster.upperBound) / price
-                }
-                let isNotTooClose = distance > 0.0005 // 0.05% зазора
-
-                return isAhead && isSignificant && isNotTooClose
-            }
-            // Сортируем по близости к текущей цене
-            .sorted { (isMovingUp) ? ($0.lowerBound < $1.lowerBound) : ($0.upperBound > $1.upperBound) }
-            .first
-    }
-    
-    //Метод для определения препятствия
-    private func determineObstacleType(obstacle: Cluster, position: Position) -> ObstacleAction {
-        let isMovingUp = (position.side == .bid)  // Вошли от Bid - идем вверх
-        let isObstacleAsk = (obstacle.side == .ask)
-        
-        if isMovingUp {
-            // Идем ВВЕРХ
-            if isObstacleAsk {
-                // Встретили ASK вверх по пути → должны ПРОБИТЬ
-                return .toBeBroken
-            } else {
-                // Встретили BID вверх по пути → должен быть ОТСКОК
-                return .toBeBounced
-            }
-        } else {
-            // Идем ВНИЗ (вошли от Ask)
-            if isObstacleAsk {
-                // Встретили ASK вниз по пути → должен быть ОТСКОК
-                return .toBeBounced
-            } else {
-                // Встретили BID вниз по пути → должны ПРОБИТЬ
-                return .toBeBroken
-            }
-        }
-    }
-
-    
-    private func willBreakThrough(obstacle: Cluster, snapshot: MarketSnapshot) async -> Bool {
-        let currentVolume = findCurrentVolume(cluster: obstacle, book: snapshot.book)
-        
-        // Проверяем, слабый ли уровень (пробивной)
-        if let stats = snapshot.battleStats[obstacle.trackingId] {
-            let attackerVol = stats.attackerVolume
-            let defenderVol = stats.defenderVolume
-            let totalDefense = currentVolume + defenderVol
-            
-            // Если атакующих много относительно защиты - пробьем
-            let breakRatio = attackerVol / (totalDefense > 0 ? totalDefense : 1.0)
-            print("🔨 [BREAK CHECK] Кластер \(obstacle.trackingId): атака/защита = \(String(format: "%.2f", breakRatio))")
-            
-            // Если атакующие > 70% от защиты - пробьем
-            return breakRatio > 0.7
+        // 1. Пробой - сразу FALSE (выходим)
+        let isBroken = (cluster.side == .bid && price < cluster.lowerBound) ||
+                       (cluster.side == .ask && price > cluster.upperBound)
+        if isBroken {
+            print("Уровень пробит!!! Выходим из рынка")
+            return false
         }
         
-        // Если нет статистики боя - смотрим просто по объему
-        let volumeDrop = currentVolume / (obstacle.totalVolume)
-        return volumeDrop < 0.5  // Если объем упал больше чем на 50% - пробьем
-        
-    }
-    
-    
-    private func willBounceFrom(obstacle: Cluster, snapshot: MarketSnapshot) async -> Bool {
-        let currentVol = findCurrentVolume(cluster: obstacle, book: snapshot.book)
-        
-        // Проверяем, сильный ли уровень (отскоковый)
-        if let stats = snapshot.battleStats[obstacle.trackingId] {
-            let attackerVol = stats.attackerVolume
-            let defenderVol = stats.defenderVolume
-            let totalDefense = currentVol + defenderVol
-            
-            // Если защита сильнее атаки - будет отскок
-            let defenseRatio = totalDefense / (attackerVol > 0 ? attackerVol : 1.0)
-            
-            print("🛡️ [BOUNCE CHECK] Кластер \(obstacle.trackingId): защита/атака = \(String(format: "%.2f", defenseRatio))")
-            
-            // Если защита > атаки в 1.5 раза - отскок
-            return defenseRatio > 1.5
+        // 2. Объем (без пауз, если рухнул - выходим)
+        let currentVol = findCurrentVolume(cluster: cluster, book: snapshot.book)
+        if (currentVol / initialVol) < 0.4 {
+            print("Объем рухнул до \(Int((currentVol / initialVol) * 100))% Выходим из рынка")
+            return false
         }
         
-        // Если нет статистики - смотрим по Z-score
-        return obstacle.strengthZScore > 3.0  // Сильный кластер - будет отскок
+        // 3. Битва (если есть данные)
+        if let stats = snapshot.battleStats[cluster.trackingId] {
+            // Если битва проиграна - FALSE
+            let battleResult = await checkBattleConditions(stats: stats, cluster: cluster, book: snapshot.book, initialVolume: initialVol)
+            if battleResult == false {
+                print("БИТВА ПРОИГРАНА: Агрессоры сильнее лимитов. Выходим из рынка.")
+                return false
+            }
+        }
+        
+        return true // Уровень всё еще живой
     }
 
     
@@ -417,7 +308,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
                 let isClose = cluster.distancePercent < Constants.maxDistancePercentForTarget // Не берем слишком далекие цели
                 
                 // 3. Фильтр по силе
-                let isStrong = cluster.strengthZScore > 0
+                let isStrong = cluster.strengthZScore > 4.5
                 
                 return isOld && isClose && isStrong
             }
