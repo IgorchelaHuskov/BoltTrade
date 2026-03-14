@@ -21,9 +21,10 @@ actor DataProvider {
         let rawStream = await wsService.start(urlString: urlString)
         
         return AsyncStream { continuation in
-            Task {
+            let task = Task {
                 // Подписываемся на сырые данные
                 for await data in rawStream {
+                    guard !Task.isCancelled else { break }
                     do {
                         // Пытаемся декодировать в нашу модель
                         let event = try decoder.decode(OrderBookStreamUpdate.self, from: data)
@@ -36,6 +37,13 @@ actor DataProvider {
                 }
                 continuation.finish()
             }
+            
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+                Task {
+                    await self.wsService.disconnect(urlString: urlString)
+                }
+            }
         }
     }
     
@@ -45,10 +53,10 @@ actor DataProvider {
         let rawStream = await wsService.start(urlString: urlString)
         
         return AsyncStream { continuation in
-            Task {
+            let task = Task {
                 // Подписываемся на сырые данные
                 for await data in rawStream {
-                    
+                    guard !Task.isCancelled else { break }
                     do {
                         // Пытаемся декодировать в нашу модель
                         let event = try decoder.decode(TradeStreams.self, from: data)
@@ -60,6 +68,13 @@ actor DataProvider {
                     }
                 }
                 continuation.finish()
+            }
+            
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+                Task {
+                    await self.wsService.disconnect(urlString: urlString)
+                }
             }
         }
     }

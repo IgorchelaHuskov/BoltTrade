@@ -33,10 +33,8 @@ actor OrderBookManager {
 
     private var connectionState: ConnectionState = .disconnected
     private var streamTask: Task<Void, Never>?
-    private var reconnectTask: Task<Void, Never>?
     private var errorMessage: String?
     private var reconnectAttempt = 0
-   //private let uiUpdateInterval = Duration.milliseconds(100) // 10 раз в секунду
     private var lastNotifyTime: ContinuousClock.Instant = .now
     private let dataProvider: DataProvider
     private let bookStreamManager: BookStreamManager
@@ -47,10 +45,6 @@ actor OrderBookManager {
     private var lastUpdateId: Int = 0
 
     private var buffer: [OrderBookStreamUpdate] = []
-    
-    private let maxReconnectAttempts = 10
-    private let baseReconnectDelay: TimeInterval = 1.0
-    private let maxReconnectDelay: TimeInterval = 300.0
     
     // Механизм для трансляции обновлений
     private let updatesContinuation: AsyncStream<LocalOrderBook>.Continuation
@@ -72,7 +66,7 @@ actor OrderBookManager {
         
         connectionState = .connecting
         
-        reconnectAttempt = 0 // Сбрасываем счетчик попыток
+        //reconnectAttempt = 0 // Сбрасываем счетчик попыток
         
         try await self.bookStreamManager.start()
         
@@ -85,8 +79,6 @@ actor OrderBookManager {
     func stopAll() async {
         streamTask?.cancel()
         streamTask = nil
-        reconnectTask?.cancel()
-        reconnectTask = nil
         buffer.removeAll()
         updatesContinuation.finish()
         connectionState = .disconnected
@@ -117,7 +109,8 @@ actor OrderBookManager {
                     // Переходим в статус .connected только при получении данных
                     if self.connectionState == .connecting {
                         self.connectionState = .connected
-                        //print("✅ WebSocket данные пошли...")
+                        self.reconnectAttempt = 0
+                        print("✅ WebSocket данные пошли...")
                     }
                     
                     // Шаг 8: Если синхронизированы — применяем сразу
@@ -140,60 +133,16 @@ actor OrderBookManager {
                 // Если вышли из стрима — проверяем причину
                 if Task.isCancelled { break }
                 self.connectionState = .disconnected
-                self.errorMessage = "Связь прервана. Реконнект через 3 сек..."
+                self.errorMessage = "Связь прервана."
                 self.buffer.removeAll()
-                
-                // Используем экспоненциальную задержку вместо фиксированной
-                await self.scheduleReconnect()
                 break
             }
         }
     }
     
-    private func scheduleReconnect() async {
-        // 1. Отменяем старую задачу переподключения, если она была
-        reconnectTask?.cancel()
-        
-        // 2. Создаем новую задачу
-        reconnectTask = Task {
-            // Мы внутри Актора, self захвачен безопасно
-            
-            if reconnectAttempt > maxReconnectAttempts {
-                self.errorMessage = "Достигнут лимит попыток переподключения (\(maxReconnectAttempts))"
-                return
-            }
-            
-            // Экспоненциальная задержка с джиттером
-            let baseDelay =  min(
-                maxReconnectDelay,
-                baseReconnectDelay * pow(2.0, Double(reconnectAttempt - 1))
-            )
-            
-            let jitter = Double.random(in: -0.2...0.2) * baseDelay
-            let delay = max(0.5, baseDelay + jitter)
-            
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            
-            // КРИТИЧНО: Проверяем, не отменили ли нас, пока мы спали
-            if Task.isCancelled { return }
-            
-            // 3. Перезапуск
-            // Мы вызываем именно свои методы управления жизненным циклом
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            streamTask?.cancel()
-            streamTask = nil
-            buffer.removeAll()
-            
-            try? await self.start() // Начнет Шаг 1 (Буфер + Snapshot)
-        }
-    }
-    
-    
     // MARK: Шаги 3-7: Синхронизация с REST snapshot
     private func synchronizeOrderBook() async{
-        if self.connectionState == .synchronizing {
-            return
-        }
+        if self.connectionState == .synchronizing { return }
         
         self.connectionState = .synchronizing
         
@@ -204,7 +153,8 @@ actor OrderBookManager {
         
         while snapshot == nil && retryCount < maxRetries && !Task.isCancelled {
             do {
-                let result = try await bookSnapshotManager.getOrderBook()
+                let force = retryCount > 0
+                let result = try await bookSnapshotManager.getOrderBook(forceUpdate: force)
                 snapshot = result
                 
             } catch {
@@ -239,7 +189,7 @@ actor OrderBookManager {
         // MARK: Шаг 4: Если lastUpdateId < U, загружаем новый снимок
         while currentSnapshot.lastUpdateId < firstBufferedEvent.firstUpdateID && !Task.isCancelled {
             do {
-                let newSnapshot = try await bookSnapshotManager.getOrderBook()
+                let newSnapshot = try await bookSnapshotManager.getOrderBook(forceUpdate: true)
                 currentSnapshot = newSnapshot
             } catch {
                 self.errorMessage = "Ошибка при перезагрузке снимка: \(error.localizedDescription)"
@@ -258,8 +208,6 @@ actor OrderBookManager {
             self.bidsDict = Dictionary(uniqueKeysWithValues: currentSnapshot.bids.map { ($0.price, $0.quantity) })
             self.asksDict = Dictionary(uniqueKeysWithValues: currentSnapshot.asks.map { ($0.price, $0.quantity) })
             self.lastUpdateId = currentSnapshot.lastUpdateId
-
-
             self.buffer.removeAll()
             self.connectionState = .synchronized
 
@@ -278,7 +226,8 @@ actor OrderBookManager {
         
         guard condition else {
             self.errorMessage = "Условие синхронизации не выполнено. Начинаем заново..."
-            Task { await self.scheduleReconnect() }
+            self.connectionState = .connected
+            self.buffer.removeAll()
             return
         }
         
@@ -317,7 +266,8 @@ actor OrderBookManager {
         // 1. Проверки ID (твои 9.1 и 9.2) - оставляем как есть
         if update.finalUpdateID <= self.lastUpdateId { return }
         if update.firstUpdateID > self.lastUpdateId + 1 {
-            Task { await self.scheduleReconnect() }
+            self.connectionState = .connected
+            self.buffer.removeAll()
             return
         }
 
