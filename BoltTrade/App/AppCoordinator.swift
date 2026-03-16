@@ -18,6 +18,7 @@ final class AppCoordinator {
     private(set) var historyService: HistoricalCandleService!
     private(set) var marketStateAnalyzer: MarketStateAnalyzer!
     private(set) var levelStatsManager: LevelStatsManager!
+    private(set) var strategyViewModel: StrategyViewModel?
     
     private var tasks: [Task<Void, Never>] = []
     
@@ -61,6 +62,7 @@ final class AppCoordinator {
             
             self.bounce = BounceStrategy()
             
+            self.strategyViewModel = StrategyViewModel(strategy: self.bounce)
             
             self.binCalculator = DynamicBinCalculator(dataService: dataService,
                                                       marketStateAnalyzer: marketStateAnalyzer,

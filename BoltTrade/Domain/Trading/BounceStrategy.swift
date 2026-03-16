@@ -8,12 +8,16 @@
 import Foundation
 
 actor BounceStrategy: TradingStrategy, Resettable {
+    private let (uiStream, uiContinuation) = AsyncStream<StrategyUIState>.makeStream()
+    nonisolated var uiEvents: AsyncStream<StrategyUIState> { uiStream }
+    
     // MARK: - Константы стратегии
     private enum Constants {
         // Поиск цели
-        static let maxClusterAge: TimeInterval  = 60.0
-        static let maxDistancePercentForTarget  = 1.0
-        static let minStrengthZScoreForTarget   = 4.5
+        static let maxClusterAge: TimeInterval      = 60.0
+        static let maxDistancePercentForTarget      = 1.0
+        static let minStrengthZScoreForTarget       = 2.5
+        static let minStrenghtZScoreForEncounter    = 2.5
         
         // Тонкий путь (thin path)
         static let thinPathThreshold = 3.3
@@ -85,9 +89,22 @@ actor BounceStrategy: TradingStrategy, Resettable {
     
     // MARK: - Протокол TradingStrategy
     func analyze(marketSnapshot: MarketSnapshot) async -> Signal? {
+        let targetCluster = findTargetCluster(in: marketSnapshot)
+      
+        let statusMessage = targetCluster == nil ? "Производится поиск целевого кластера..." : "Целевой кластер найден и отслеживается"
+        let newState = StrategyUIState(price: marketSnapshot.currentPrice,
+                                       marketStatus: marketSnapshot.state.rawValue,
+                                       //strategyState: String(describing: self.state),
+                                       asks: formatUIClusters(from: marketSnapshot.clusters, side: .ask),
+                                       bids: formatUIClusters(from: marketSnapshot.clusters, side: .bid),
+                                       targetCluster: targetCluster.map { targetClusterInfo(cluster: $0) },
+                                       statusMessage: statusMessage
+        )
+        uiContinuation.yield(newState)
+        
         switch state {
         case .scanning:
-            return await handleScanning(snapshot: marketSnapshot)
+            return await handleScanning(snapshot: marketSnapshot, foundCluster: targetCluster)
         case .monitoring(let context):
             return await handleMonitoring(context: context, snapshot: marketSnapshot)
         case .positionOpen(let position):
@@ -100,8 +117,8 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     // MARK: - Обработка состояний
-    private func handleScanning(snapshot: MarketSnapshot) async -> Signal? {
-        guard let targetCluster = findTargetCluster(in: snapshot) else { return nil }
+    private func handleScanning(snapshot: MarketSnapshot, foundCluster: Cluster?) async -> Signal? {
+        guard let targetCluster = foundCluster else { return nil }
         let initialVolume = currentVolume(for: targetCluster, in: snapshot.book)
         let context = MonitoringContext(
             cluster: targetCluster,
@@ -368,10 +385,14 @@ actor BounceStrategy: TradingStrategy, Resettable {
     private func findEncounterCluster(in snapshot: MarketSnapshot, position: Position) -> Cluster? {
         let currentPrice = snapshot.currentPrice
         return snapshot.clusters
-            .filter {
-                $0.trackingId != position.sourceClusterId &&
-                !position.processedClusterIds.contains($0.trackingId) &&
-                didPriceTouchCluster(price: currentPrice, cluster: $0)
+            .filter { cluster in
+                let isClose = cluster.distancePercent < Constants.maxDistancePercentForTarget
+                let isStrong = cluster.strengthZScore > Constants.minStrenghtZScoreForEncounter
+                
+                let isNotTarget = cluster.trackingId != position.sourceClusterId
+                let isProcessed = !position.processedClusterIds.contains(cluster.trackingId)
+                let isTouchCluster = didPriceTouchCluster(price: currentPrice, cluster: cluster)
+                return isClose && isStrong && isNotTarget && isProcessed && isTouchCluster
             }
             .min { abs($0.price - currentPrice) < abs($1.price - currentPrice) }
     }
@@ -674,5 +695,37 @@ actor BounceStrategy: TradingStrategy, Resettable {
     
     private func logEncounterMovedInFavor(_ cluster: Cluster) {
         print("✅ [\(cluster.trackingId)] Цена вышла из встречного кластера в сторону позиции. Продолжаем.")
+    }
+    
+    
+    private func formatUIClusters(from clusters: [Cluster], side: Side) -> [ClusterRow] {
+        // 1. Фильтруем: нужная сторона + сила > 2.5
+        let filtered = clusters.filter {
+            $0.side == side && $0.strengthZScore > 2.5
+        }
+        
+        // 3. Сортируем (ASK — по возрастанию цены, BID — по убыванию)
+        let sorted = side == .ask
+            ? filtered.sorted { $0.price < $1.price }
+            : filtered.sorted { $0.price > $1.price }
+
+        // 4. Превращаем в UI-модели
+        return sorted.prefix(5).map { cluster in
+            ClusterRow(id: cluster.id,
+                       price: cluster.price,
+                       volume: cluster.totalVolume,
+                       power: cluster.strengthZScore,
+                       distancePercent: cluster.distancePercent)
+        }
+    }
+    
+    
+    private func targetClusterInfo(cluster: Cluster) -> TargetClusterInfo {
+        return TargetClusterInfo(id: cluster.id,
+                                 lowerBound: cluster.lowerBound,
+                                 upperBound: cluster.upperBound,
+                                 type: String(describing: cluster.side),
+                                 volume: cluster.totalVolume,
+                                 power: cluster.strengthZScore)
     }
 }
