@@ -916,6 +916,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         
         let item = TradeHistoryItem(
             entryDate: entryPosition.openTime,
+            exitData: exitDate,
             entryPrice: entryPosition.entryPrice,
             exitPrice: exitPrice,
             profitLoss: pnlAbsolute,

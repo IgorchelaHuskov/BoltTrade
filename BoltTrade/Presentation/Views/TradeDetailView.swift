@@ -37,12 +37,12 @@ struct TradeDetailView: View {
                 DetailRow(label: "Пара", value: "BTC/USDT")
                 DetailRow(label: "Дата входа", value: trade.entryDate.formatted())
                 DetailRow(label: "Цена входа", value: String(format: "$%.2f", trade.entryPrice))
-                DetailRow(label: "Сила кластера", value: String(format: ".2f", trade.power))
-                DetailRow(label: "Объем кластера", value: String(format: ".2f", trade.volume))
+                DetailRow(label: "Сила кластера", value: String(format: "%.2f", trade.power))
+                DetailRow(label: "Объем кластера", value: String(format: "%.2f", trade.volume))
                 
                 if let exitPrice = trade.exitPrice {
                     DetailRow(label: "Цена выхода", value: String(format: "$%.2f", exitPrice))
-                    DetailRow(label: "Дата выхода", value: trade.entryDate.addingTimeInterval(3600).formatted())
+                    DetailRow(label: "Дата выхода", value: trade.exitData.formatted())
                 }
                 
                 Divider()

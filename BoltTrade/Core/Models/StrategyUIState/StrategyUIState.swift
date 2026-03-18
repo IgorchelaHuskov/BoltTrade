@@ -68,6 +68,7 @@ struct PositionInfo {
 struct TradeHistoryItem: Identifiable {
     let id = UUID()
     let entryDate: Date
+    let exitData: Date
     let entryPrice: Double
     let exitPrice: Double?
     let profitLoss: Double

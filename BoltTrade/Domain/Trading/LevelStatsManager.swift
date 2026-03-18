@@ -42,40 +42,32 @@ actor LevelStatsManager {
         guard var stats = statsByLevel[key] else { return }
 
         // 2. Определяем тип рыночного ордера (Агрессора)
-        // В Binance: m (isBuyerMaker) == true означает, что рыночный ордер был SELL
-        let isMarketSell = trade.isBuyer
-        let isMarketBuy = !trade.isBuyer
+        // m = true означает Buyer is Maker -> Агрессор SELL
+        // m = false означает Buyer is Not Maker -> Агрессор BUY
+        let isAggressiveBuy = !trade.isMaker
+        let isAggressiveSell = trade.isMaker
 
         switch cluster.side {
-        case .bid:
-            // Уровень BID (поддержка) защищают ЛИМИТНЫЕ покупатели.
-            // Агрессоры для них — это те, кто ПРОДАЕТ по рынку.
-            if isMarketSell {
-                // Атака: бьют в лимиты продажами
-                stats.attackerVolume += trade.quantity
-            } else if isMarketBuy {
-                // ЗАЩИТА: кто-то выкупает по рынку прямо от уровня
-                stats.defenderVolume += trade.quantity
+        case .bid: // Уровень поддержки (Лимитные покупки)
+            if isAggressiveSell {
+                stats.attackerVolume += trade.quantity // Продавец бьет в лимиты покупок
+            } else if isAggressiveBuy {
+                stats.defenderVolume += trade.quantity // Рыночный покупатель помогает защищать
             }
             
-        case .ask:
-            // Уровень ASK (сопротивление) защищают ЛИМИТНЫЕ продавцы.
-            // Агрессоры для них — это те, кто ПОКУПАЕТ по рынку.
-            if isMarketBuy {
-                // Атака: пытаются пробить покупками
-                stats.attackerVolume += trade.quantity
-            } else if isMarketSell {
-                // ЗАЩИТА: кто-то заливает продажи по рынку, помогая лимитам
-                stats.defenderVolume += trade.quantity
+        case .ask: // Уровень сопротивления (Лимитные продажи)
+            if isAggressiveBuy {
+                stats.attackerVolume += trade.quantity // Покупатель бьет в лимиты продаж
+            } else if isAggressiveSell {
+                stats.defenderVolume += trade.quantity // Рыночный продавец помогает защищать
             }
         }
+
         
         stats.lastUpdated = Date()
         statsByLevel[key] = stats
     }
 
-
-    
     
     // Получить статистику для конкретного кластера
     func getAllStats() -> [Double: LevelBattleStats] {

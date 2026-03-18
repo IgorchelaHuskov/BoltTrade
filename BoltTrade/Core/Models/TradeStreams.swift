@@ -30,7 +30,7 @@ struct TradeStreams: Decodable, Sendable {
     let price: Double
     let quantity: Double
     let tradeTime: Int
-    let isBuyer: Bool  // агрессивный ПОКУПАТЕЛЬ? 
+    let isMaker: Bool  // агрессивный ПОКУПАТЕЛЬ?
     
     enum CodingKeys: String, CodingKey {
         case eventType = "e"
@@ -40,7 +40,7 @@ struct TradeStreams: Decodable, Sendable {
         case price = "p"
         case quantity = "q"
         case tradeTime = "T"
-        case isBuyer = "m"
+        case isMaker = "m"
     }
     
     nonisolated init(from decoder: Decoder) throws {
@@ -53,7 +53,7 @@ struct TradeStreams: Decodable, Sendable {
         let priceStrind = try container.decode(String.self, forKey: .price)
         let quantityString = try container.decode(String.self, forKey: .quantity)
         self.tradeTime = try container.decode(Int.self, forKey: .tradeID)
-        self.isBuyer = try container.decode(Bool.self, forKey: .isBuyer)
+        self.isMaker = try container.decode(Bool.self, forKey: .isMaker)
         
         self.price = Double(priceStrind) ?? 0
         self.quantity = Double(quantityString) ?? 0
