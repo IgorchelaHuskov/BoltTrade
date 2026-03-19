@@ -312,6 +312,21 @@ actor BounceStrategy: TradingStrategy, Resettable {
         
         // 8. Проверка выхода цены из зоны (пружина)
         if isPriceBouncingOff(cluster: cluster, price: snapshot.currentPrice) {
+            // Проверяем свободный путь и риск/прибыль
+            guard let rr = calculateRR(currentCluster: cluster, allClusters: snapshot.clusters, minStrength: Constants.minStrenghtZScoreForEncounter) else {
+                logNoFreePath(cluster) // добавить соответствующий лог
+                await reset()
+                return nil
+            }
+            
+            // Минимальное приемлемое соотношение
+            let minRatio = 2.0
+            guard rr.ratio >= minRatio else {
+                logLowRiskReward(cluster, ratio: rr.ratio)
+                await reset()
+                return nil
+            }
+            
             let position = createPosition(from: cluster, entryPrice: snapshot.currentPrice, context: context)
             logSignalFormed(cluster, position: position, snapshot: snapshot, currentVolume: currentVolume(for: cluster, in: snapshot.book))
             state = .positionOpen(position)
@@ -355,9 +370,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
                     await reset()
                     return .exit
                 }
-            } else {
-                // Цена вышла в прибыль – больше не следим за родным кластером
-                logExitedSourceClusterInProfit(position)
             }
         }
         
@@ -408,6 +420,49 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     // MARK: - Вспомогательные методы (логика проверок)
+    private func calculateRR(currentCluster: Cluster, allClusters: [Cluster], minStrength: Double) -> (ratio: Double, target: Double, stop: Double)? {
+        let isBid = currentCluster.side == .bid
+        let direction = isBid ? 1.0 : -1.0
+        
+        // Точка входа — край кластера, с которого заходит цена
+        let entryPrice = isBid ? currentCluster.upperBound : currentCluster.lowerBound
+        
+        // Стоп за противоположным краем + 20% ширины
+        let stopPadding = currentCluster.binSize * 0.2
+        let stopPrice = isBid
+            ? (currentCluster.lowerBound - stopPadding)
+            : (currentCluster.upperBound + stopPadding)
+        
+        // Минимальное расстояние до цели — 2.5 ширины кластера (чтобы пропустить шум)
+        let minDistance = currentCluster.binSize * 2.5
+        
+        // Ищем ближайший сильный кластер в направлении движения
+        let targetCluster = allClusters
+            .filter { cluster in
+                // Только кластеры с достаточной силой
+                guard cluster.strengthZScore >= minStrength else { return false }
+                // Должен находиться дальше minDistance от точки входа
+                let distance = (cluster.price - entryPrice) * direction
+                return distance > minDistance
+            }
+            .min { abs($0.price - entryPrice) < abs($1.price - entryPrice) }
+        
+        // Если целевой кластер найден — используем его цену, иначе консервативная цель (5 ширин)
+        let finalTargetPrice: Double
+        if let target = targetCluster {
+            finalTargetPrice = target.price
+        } else {
+            finalTargetPrice = entryPrice + (direction * currentCluster.binSize * 5.0)
+        }
+        
+        let risk = abs(entryPrice - stopPrice)
+        let reward = abs(finalTargetPrice - entryPrice)
+        guard risk > 0 else { return nil }
+        let ratio = reward / risk
+        
+        return (ratio, finalTargetPrice, stopPrice)
+    }
+    
     
     private func clusterExists(_ cluster: Cluster, in snapshot: MarketSnapshot) -> Bool {
         snapshot.clusters.contains { $0.trackingId == cluster.trackingId }
@@ -778,7 +833,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     private func logEncounterMonitoringStarted(_ cluster: Cluster) {
-        print("🔄 [\(cluster.trackingId)] Начат мониторинг встречного кластера.")
+        print("🔄 [\\(cluster.trackingId)-\(cluster.side)] Начат мониторинг встречного кластера.")
     }
     
     private func logEncounterClusterRemoved(_ id: Double) {
@@ -786,43 +841,47 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     private func logEncounterBasicConditionsFailed(_ cluster: Cluster) -> String {
-        return ("❌ [\(cluster.trackingId)] Базовые условия нарушены для встречного кластера")
+        return ("❌ [\\(cluster.trackingId)-\(cluster.side)] Базовые условия нарушены для встречного кластера")
     }
     
     private func logEncounterBreakthrough(_ cluster: Cluster) -> String {
-        return("💀 [\(cluster.trackingId)] Встречный кластер пробит в нежелательную сторону. Выход.")
+        return("💀 [\(cluster.trackingId)-\(cluster.side)] Встречный кластер пробит в нежелательную сторону. Выход.")
     }
     
     private func logEncounterCriticalDrop(_ cluster: Cluster) -> String {
-        return("💥 [\(cluster.trackingId)] Критический сброс объёма на встречном кластере (ожидалась сила). Выход.")
+        return("💥 [\(cluster.trackingId)-\(cluster.side)] Критический сброс объёма на встречном кластере (ожидалась сила). Выход.")
     }
     
     private func logEncounterCriticalDropButExpectedWeak(_ cluster: Cluster) {
-        print("📉 [\(cluster.trackingId)] Критический сброс объёма (помогает пробою). Продолжаем.")
+        print("📉 [\(cluster.trackingId)-\(cluster.side)] Критический сброс объёма (помогает пробою). Продолжаем.")
     }
     
     private func logEncounterVolumePause(_ cluster: Cluster) {
-        print("⏳ [\(cluster.trackingId)] Пауза: объём мерцает на встречном кластере")
+        print("⏳ [\(cluster.trackingId)-\(cluster.side)] Пауза: объём мерцает на встречном кластере")
     }
     
     private func logEncounterVolatilitySpike(_ cluster: Cluster) -> String {
-        return("⚠️ [\(cluster.trackingId)] Обнаружен всплеск волатильности на встречном кластере. Выход.")
+        return("⚠️ [\(cluster.trackingId)-\(cluster.side)] Обнаружен всплеск волатильности на встречном кластере. Выход.")
     }
     
     private func logEncounterWaitingForBattle(_ cluster: Cluster) {
-        print("⚔️ [\(cluster.trackingId)] Ждём первых рыночных ударов во встречный кластер...")
+        print("⚔️ [\\(cluster.trackingId)-\(cluster.side)] Ждём первых рыночных ударов во встречный кластер...")
     }
     
     private func logEncounterBattleUnexpected(_ cluster: Cluster) -> String {
-        return("🚩 [\(cluster.trackingId)] Битва на встречном кластере идёт против ожиданий. Выход.")
+        return("🚩 [\(cluster.trackingId)-\(cluster.side)] Битва на встречном кластере идёт против ожиданий. Выход.")
     }
     
     private func logEncounterMovedInFavor(_ cluster: Cluster) {
-        print("✅ [\(cluster.trackingId)] Цена вышла из встречного кластера в сторону позиции. Продолжаем.")
+        print("✅ [\(cluster.trackingId)-\(cluster.side)] Цена вышла из встречного кластера в сторону позиции. Продолжаем.")
     }
     
-    private func logExitedSourceClusterInProfit(_ position: Position) {
-        print("💰 Цена вышла из родного кластера в сторону прибыли. Мониторинг здоровья отключён.")
+    private func logNoFreePath(_ cluster: Cluster) {
+        print("🚫 [\(cluster.trackingId)-\(cluster.side)] Нет свободного пути: ближайший сильный кластер слишком близко.")
+    }
+
+    private func logLowRiskReward(_ cluster: Cluster, ratio: Double) {
+        print("📉 [\(cluster.trackingId)-\(cluster.side)] Недостаточное соотношение риск/прибыль: \(String(format: "%.2f", ratio)) < 2.0")
     }
     
     
