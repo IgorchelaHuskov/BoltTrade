@@ -139,16 +139,6 @@ actor OrderBookClusterer {
             // средняя цена кластера
             let clusterPrice = binLow + binSizeAbs / 2.0
             
-            /*print("""
-            📊 Статистика для бина \(binLow):
-               volumeShare: \(String(format: "%.2f", volumeShare))%
-               rawPressure: \(String(format: "%.3f", rawPressure))
-               strength: \(String(strength))
-               mean: \(String(format: "%.0f", stats.mean))
-               stdev: \(String(format: "%.0f", stats.stdev))
-               dominantVol: \(dominantVol)
-            """)*/
-            
             return Cluster(id: binLow,
                            price: clusterPrice,
                            totalVolume: dominantVol,
@@ -186,32 +176,40 @@ actor OrderBookClusterer {
     // MARK: - Consistent Tracking
     private func ensureConsistentTracking(rawClusters: [Cluster], binSizeAbs: Double) -> [Cluster] {
         let now = Date()
-        var result: [Cluster] = []
-        
+        var trackingMap: [Double: Cluster] = [:]  // trackingId -> объединённый кластер
+
         for var cluster in rawClusters {
-            // Вычисляем trackingId с фиксированным размером 100$
-            let trackingId = calculateTrackingId( for: cluster.price, trackingBinSize: 100.0)
+            // Вычисляем базовый trackingId (округление до 100.0)
+            let trackingId = calculateTrackingId(for: cluster.price, trackingBinSize: 100.0)
             
-            // ИЩЕМ ВСЕ trackingHistory в радиусе 300$ (3 бина)
+            // Поиск существующих trackingId в радиусе
             let nearbyHistory = findNearbyTrackingHistory(targetId: trackingId, radius: trackingBinSize * 1.5)
             let finalTrackingID: Double
             if let existing = nearbyHistory.first, abs(existing.key - trackingId) <= trackingBinSize * 1.5 {
-                // ПЕРЕНАЗНАЧАЕМ на ближайший СУЩЕСТВУЮЩИЙ trackingId!
                 finalTrackingID = existing.key
             } else {
-                // НОВЫЙ уровень
                 finalTrackingID = trackingId
             }
             
             cluster.trackingId = finalTrackingID
             
-            // Обновляем ИСТОРИЮ для ЭТОГО trackingId
+            // Обновляем историю отслеживания
             updateTrackingHistory(for: finalTrackingID, cluster: cluster, now: now)
-            result.append(cluster)
+            
+            // Группировка по trackingId – объединяем или оставляем сильнейший
+            if let existingCluster = trackingMap[finalTrackingID] {
+                // Выбираем кластер с максимальной силой
+                if cluster.strength > existingCluster.strength {
+                    trackingMap[finalTrackingID] = cluster
+                }
+                // При необходимости можно объединять объёмы, но для простоты оставляем сильнейший
+            } else {
+                trackingMap[finalTrackingID] = cluster
+            }
         }
         
         cleanupOldTrackingHistory(currentTime: now)
-        return result
+        return Array(trackingMap.values)
     }
     
     
