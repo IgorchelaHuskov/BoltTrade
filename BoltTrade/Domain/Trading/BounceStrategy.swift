@@ -80,6 +80,8 @@ actor BounceStrategy: TradingStrategy, Resettable {
         let power: Double
         let side: Side
         var stopLoss: Double
+        let entryLowerBound: Double
+        let entryUpperBound: Double
         var monitoringCluster: MonitoringContext? = nil
         var processedClusterIds: Set<Double> = []
         let sourceClusterStartTime: ContinuousClock.Instant
@@ -285,12 +287,11 @@ actor BounceStrategy: TradingStrategy, Resettable {
         
         // 3. Проверка здоровья исходного кластера (только если цена еще внутри его зоны)
         if let myCluster = snapshot.clusters.first(where: { $0.trackingId == position.sourceClusterId }) {
-            // Определяем, вышел ли цена из зоны кластера в сторону прибыли
             let hasExitedInProfit: Bool
-            if position.side == .bid { // LONG (поддержка)
-                hasExitedInProfit = snapshot.currentPrice > myCluster.upperBound
-            } else { // SHORT (сопротивление)
-                hasExitedInProfit = snapshot.currentPrice < myCluster.lowerBound
+            if position.side == .bid {
+                hasExitedInProfit = snapshot.currentPrice > position.entryUpperBound
+            } else {
+                hasExitedInProfit = snapshot.currentPrice < position.entryLowerBound
             }
             
             if !hasExitedInProfit {
@@ -727,6 +728,8 @@ actor BounceStrategy: TradingStrategy, Resettable {
             power: cluster.strength,
             side: cluster.side,
             stopLoss: stopLoss,
+            entryLowerBound: cluster.lowerBound,
+            entryUpperBound: cluster.upperBound,
             sourceClusterStartTime: context.startTime,
             openTime: Date(),
             leverage: Double(Constants.defaultLeverage)
