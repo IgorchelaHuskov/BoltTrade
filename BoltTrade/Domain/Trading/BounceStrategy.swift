@@ -12,23 +12,23 @@ actor BounceStrategy: TradingStrategy, Resettable {
     private var state: StrategyState = .scanning
     private var tradeHistory: [TradeHistoryItem] = []
     
+    //MARK: UI
     private let (uiStream, uiContinuation) = AsyncStream<StrategyUIState>.makeStream()
     nonisolated var uiEvents: AsyncStream<StrategyUIState> { uiStream }
     
     // MARK: - Константы стратегии
     private enum Constants {
         // Поиск цели
-        static let maxClusterAge: TimeInterval      = 60.0
-        static let maxDistancePercentForTarget      = 0.2
-        static let minStrengthZScoreForTarget       = 4.5
-        static let minFinalStrength                 = 0.2
-        static let minStrenghtZScoreForEncounter    = 2.5
+        static let maxClusterAge: TimeInterval = 180.0     // 3 минуты (даем уровню настояться)
+        static let maxDistancePercentForTarget = 0.5       // (0.5%) - отлично
+        static let minStrengthZScoreForTarget  = 3.0       // золотая середина аномальности
+        static let minFinalStrength            = 0.1       // видим "кирпичные стены", а не только "бетон"
         
         // Тонкий путь (thin path)
         static let thinPathThreshold = 3.3
         
         // Общая дистанция до кластера
-        static let maxDistanceToCluster = 0.001
+        static let maxDistanceToCluster = 0.01
         
         // Волатильность (спуфинг)
         static let volatilitySpikeRadius            = 0.002 // 0.2%
@@ -36,27 +36,33 @@ actor BounceStrategy: TradingStrategy, Resettable {
         static let maxSpreadPercent                 = 0.001 // 0.1%
         
         // Битва
-        static let attackerMinVolume          = 0.5
-        static let requiredLimitToAttackRatio = 1.5
-        static let minRemainingLimitRatio     = 0.3 // 30% от начального объёма
+        static let attackerMinVolume          = 1.0
+        static let requiredLimitToAttackRatio = 4.0
+        static let minRemainingLimitRatio     = 0.6 // 40% от начального объёма
         static let criticalVolumeDropRatio    = 0.4 // 40%
         
         // Стоп-лосс отступ
         static let stopLossOffsetPercent = 0.001 // 0.1%
         
         // Встречный кластер
-        static let volumeStabilityThreshold = 0.9
+        static let volumeStabilityThreshold      = 0.9
+        static let minStrenghtZScoreForEncounter = 2.2
+           
         
         // Трейлинг-стоп
         static let totalCosts               = 0.0011   // 0.11% (комиссии + спред)
-        static let breakEvenActivation      = 0.002    // 0.2%
-        static let trailingStepPercent      = 0.01     // 1%
+        static let breakEvenActivation      = 0.0015    // 0.2%
+        static let trailingStepPercent      = 0.002    // 1%
         static let minStopMoveRelative      = 0.1      // 10% от шага
         static let defaultLeverage          = 50       // кредитное плечо
         
         // UI
-        static let uiMinStrengthZScore      = 2.5
-        static let uiMinStrength            = 0.01
+        static let uiMinStrengthZScore      = 3.0
+        static let uiMinStrength            = 0.1
+    }
+    
+    private enum VolumeStabilityStatus {
+        case ok, pause, critical
     }
     
     // MARK: - Вспомогательные типы
@@ -120,91 +126,12 @@ actor BounceStrategy: TradingStrategy, Resettable {
             signal = await handlePositionOpen(position: position, snapshot: marketSnapshot)
         }
         
-        // 3. ТЕПЕРЬ ОБНОВЛЯЕМ UI (на основе уже нового состояния)
+        // 3.ОБНОВЛЯЕМ UI (на основе уже нового состояния)
         updateUI(snapshot: marketSnapshot, targetCluster: foundCluster)
         
         return signal
     }
-    
-    private func updateUI(snapshot: MarketSnapshot, targetCluster: Cluster?) {
-        var clusterToShow: TargetClusterInfo? = nil
-        var message = "Производится поиск..."
-        var positionInfo: PositionInfo? = nil
-        
-        switch self.state {
-        case .scanning:
-            if let found = targetCluster {
-                clusterToShow = currentTargetClusterInfo(cluster: found, context: nil, snapshot: snapshot)
-                message = "Кластер найден, проверяем условия..."
-            }
-            
-        case .monitoring(let context):
-            clusterToShow = currentTargetClusterInfo(
-                cluster: context.cluster,
-                context: context,
-                snapshot: snapshot
-            )
-            if clusterToShow?.hasTouched == true {
-                if clusterToShow?.isWaitingForBounce == true {
-                    message = "Ждем пружину... \(clusterToShow?.priceCondition ?? "")"
-                } else {
-                    message = "Идет битва за уровень"
-                }
-            } else {
-                message = "Ожидаем касания уровня"
-            }
-            
-        case .positionOpen(let position):
-            // 1. Информация о родном кластере
-            let sourceClusterInfo: TargetClusterInfo? = snapshot.clusters.first(where: { $0.trackingId == position.sourceClusterId }).map { cluster in
-                let sourceContext = MonitoringContext(
-                    cluster: cluster,
-                    startTime: position.sourceClusterStartTime,
-                    initialVolume: position.initialVolume,
-                    hasTouched: true
-                )
-                return currentTargetClusterInfo(cluster: cluster, context: sourceContext, snapshot: snapshot)
-            }
-            
-            // 2. Информация о встречном кластере (если есть)
-            let encounterClusterInfo: TargetClusterInfo? = position.monitoringCluster.map { context in
-                currentTargetClusterInfo(cluster: context.cluster, context: context, snapshot: snapshot)
-            }
-            
-            // 3. Расчёт P&L (условный размер 100 единиц базовой валюты)
-            let price = snapshot.currentPrice
-            let entry = position.entryPrice
-            let rawPnLPercent = (price - entry) / entry * 100  // процент относительно входа
-            let pnlPercent = rawPnLPercent * position.leverage  // процент с учётом плеча
-            let pnlAbsolute = rawPnLPercent * 100.0            // абсолютный P&L в USDT при инвестиции 100 USDT
-            
-            positionInfo = PositionInfo(
-                side: position.side,
-                entryPrice: position.entryPrice,
-                openTime: position.openTime,
-                pnlPercent: pnlPercent,
-                pnlAbsolute: pnlAbsolute,
-                sourceCluster: sourceClusterInfo,
-                encounterCluster: encounterClusterInfo
-            )
-            
-            message = "Позиция открыта"
-        }
-        
-        let newState = StrategyUIState(
-            price: snapshot.currentPrice,
-            marketStatus: snapshot.state.rawValue,
-            asks: clustersForUi(from: snapshot.clusters, side: .ask),
-            bids: clustersForUi(from: snapshot.clusters, side: .bid),
-            targetCluster: clusterToShow,
-            statusMessage: message,
-            positionInfo: positionInfo,
-            tradeHistory: tradeHistory
-        )
-        
-        uiContinuation.yield(newState)
-    }
-    
+
     func reset() async {
         state = .scanning
     }
@@ -531,10 +458,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
         (position.side == .ask && currentPrice >= position.stopLoss)
     }
     
-    private enum VolumeStabilityStatus {
-        case ok, pause, critical
-    }
-    
     private func checkVolumeStability(cluster: Cluster, currentVolume: Double, initialVolume: Double, battleStats: LevelBattleStats?) -> VolumeStabilityStatus {
         let volumeRatio = currentVolume / initialVolume
         guard volumeRatio < Constants.volumeStabilityThreshold else { return .ok }
@@ -554,32 +477,43 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     private func checkBattleConditions(stats: LevelBattleStats, cluster: Cluster, book: LocalOrderBook, initialVolume: Double) async -> BattleOutcome {
-        let attackerVol = stats.attackerVolume
-        let defenderVolume = stats.defenderVolume
-        let currentLimit = currentVolume(for: cluster, in: book)
-        let totalDefensePower = currentLimit + defenderVolume
+        let attackerVol = stats.attackerVolume     // Сколько в нас ударили рынком (агрессия)
+        let defenderVol = stats.defenderVolume     // Сколько мы выкупили встречным рынком (активная защита)
+        let currentLimit = currentVolume(for: cluster, in: book) // Что осталось в стакане прямо сейчас
         
-        // Недостаточно атакующих — ждём
+        // 1. Проверка на "Пустоту"
         if attackerVol < Constants.attackerMinVolume {
             return .pending
         }
         
-        // Лимиты истощены — проигрыш
-        let minRequiredLimit = initialVolume * Constants.minRemainingLimitRatio
-        if currentLimit < minRequiredLimit {
+        // 2. Тройной фильтр выживания (Выходим, если...)
+        // А) Лимиты съели больше чем на 40% (порог 0.6)
+        let isLimitDepleted = currentLimit < (initialVolume * Constants.minRemainingLimitRatio)
+        // Б) Агрессор влил в 2 раза больше, чем мы смогли активно защитить
+        let isDefenseOverwhelmed = attackerVol > (defenderVol * 2.0) && attackerVol > 2.0
+        
+        if isLimitDepleted || isDefenseOverwhelmed {
             return .lose
         }
         
-        // Соотношение защиты к атаке
-        let armorRatio = totalDefensePower / max(attackerVol, 1.0)
+        // 3. Расчет итоговой мощности брони (Armor)
+        // Мы суммируем то, что СТОИТ (лимит), и то, что РЕАЛЬНО ОТБИТО (defenderVol)
+        // Но лимитам даем приоритет (коэффициент 1.0), а защите (0.7), так как она уже в прошлом
+        let effectiveDefense = currentLimit + (defenderVol * 0.7)
+        let armorRatio = effectiveDefense / max(attackerVol, 1.0)
         
-        // Если уровень силён (защитники активны) — пропускаем даже при меньшем armour
-        if await stats.isStrong {   // <-- убрали await
+        // 4. Проверка условий победы
+        let isStatsStrong = await stats.isStrong
+        let requiredRatio = isStatsStrong ? 2.5 : Constants.requiredLimitToAttackRatio
+        
+        // Победили, если брони достаточно И лимиты все еще крепкие
+        if armorRatio >= requiredRatio && !isLimitDepleted {
             return .win
         }
         
-        return armorRatio >= Constants.requiredLimitToAttackRatio ? .win : .lose
+        return .pending // Если сомневаемся - лучше подождать (pending), чем входить или сдаваться
     }
+
     
     private func checkLevelHealth(cluster: Cluster, snapshot: MarketSnapshot, initialVol: Double) async -> Bool {
         // Пробой — смерть
@@ -958,6 +892,86 @@ actor BounceStrategy: TradingStrategy, Resettable {
     
     private func logStopLossUpdated(position: Position) {
         log("Позиция STOP LOSE передвинулась на \(position.stopLoss)")
+    }
+    
+    // MARK: Методы для UI
+    private func updateUI(snapshot: MarketSnapshot, targetCluster: Cluster?) {
+        var clusterToShow: TargetClusterInfo? = nil
+        var message = "Производится поиск..."
+        var positionInfo: PositionInfo? = nil
+        
+        switch self.state {
+        case .scanning:
+            if let found = targetCluster {
+                clusterToShow = currentTargetClusterInfo(cluster: found, context: nil, snapshot: snapshot)
+                message = "Кластер найден, проверяем условия..."
+            }
+            
+        case .monitoring(let context):
+            clusterToShow = currentTargetClusterInfo(
+                cluster: context.cluster,
+                context: context,
+                snapshot: snapshot
+            )
+            if clusterToShow?.hasTouched == true {
+                if clusterToShow?.isWaitingForBounce == true {
+                    message = "Ждем пружину... \(clusterToShow?.priceCondition ?? "")"
+                } else {
+                    message = "Идет битва за уровень"
+                }
+            } else {
+                message = "Ожидаем касания уровня"
+            }
+            
+        case .positionOpen(let position):
+            // 1. Информация о родном кластере
+            let sourceClusterInfo: TargetClusterInfo? = snapshot.clusters.first(where: { $0.trackingId == position.sourceClusterId }).map { cluster in
+                let sourceContext = MonitoringContext(
+                    cluster: cluster,
+                    startTime: position.sourceClusterStartTime,
+                    initialVolume: position.initialVolume,
+                    hasTouched: true
+                )
+                return currentTargetClusterInfo(cluster: cluster, context: sourceContext, snapshot: snapshot)
+            }
+            
+            // 2. Информация о встречном кластере (если есть)
+            let encounterClusterInfo: TargetClusterInfo? = position.monitoringCluster.map { context in
+                currentTargetClusterInfo(cluster: context.cluster, context: context, snapshot: snapshot)
+            }
+            
+            // 3. Расчёт P&L (условный размер 100 единиц базовой валюты)
+            let price = snapshot.currentPrice
+            let entry = position.entryPrice
+            let rawPnLPercent = (price - entry) / entry * 100  // процент относительно входа
+            let pnlPercent = rawPnLPercent * position.leverage  // процент с учётом плеча
+            let pnlAbsolute = rawPnLPercent * 100.0            // абсолютный P&L в USDT при инвестиции 100 USDT
+            
+            positionInfo = PositionInfo(
+                side: position.side,
+                entryPrice: position.entryPrice,
+                openTime: position.openTime,
+                pnlPercent: pnlPercent,
+                pnlAbsolute: pnlAbsolute,
+                sourceCluster: sourceClusterInfo,
+                encounterCluster: encounterClusterInfo
+            )
+            
+            message = "Позиция открыта"
+        }
+        
+        let newState = StrategyUIState(
+            price: snapshot.currentPrice,
+            marketStatus: snapshot.state.rawValue,
+            asks: clustersForUi(from: snapshot.clusters, side: .ask),
+            bids: clustersForUi(from: snapshot.clusters, side: .bid),
+            targetCluster: clusterToShow,
+            statusMessage: message,
+            positionInfo: positionInfo,
+            tradeHistory: tradeHistory
+        )
+        
+        uiContinuation.yield(newState)
     }
     
     private func clustersForUi(from clusters: [Cluster], side: Side) -> [ClusterRow] {
