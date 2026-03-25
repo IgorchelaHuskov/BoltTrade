@@ -11,10 +11,28 @@ struct LevelBattleStats: Sendable {
     let trackingId: Double
     let side: Side
     let price: Double
-    var defenderVolume: Double = 0  // кто защищает уровень
-    var attackerVolume: Double = 0  // кто атакует уровень
+    var defenderVolume: Double = 0
+    var attackerVolume: Double = 0
     var lastUpdated: Date = Date()
     var firstSeen: Date = Date()
+    
+    // Для расчёта рефилла
+    var attackerVolumeHistory: [(volume: Double, timestamp: Date)] = []
+    let historyWindowSeconds: TimeInterval = 60
+    
+    mutating func addAttackerVolume(_ volume: Double, at time: Date) {
+        attackerVolumeHistory.append((volume, time))
+        attackerVolume += volume
+        
+        // Удаляем старые записи
+        attackerVolumeHistory = attackerVolumeHistory.filter {
+            time.timeIntervalSince($0.timestamp) < historyWindowSeconds
+        }
+    }
+    
+    var recentAttackerVolume: Double {
+        return attackerVolumeHistory.reduce(0) { $0 + $1.volume }
+    }
     
     var ratio: Double {
         defenderVolume > 0 ? attackerVolume / defenderVolume : attackerVolume

@@ -19,7 +19,6 @@ actor LevelStatsManager {
         // Добавляем новые кластеры в статистику
         for cluster in clusters {
             let key = cluster.trackingId
-            
             if statsByLevel[key] == nil {
                 statsByLevel[key] = LevelBattleStats(trackingId: key, side: cluster.side, price: cluster.price)
             }
@@ -32,7 +31,7 @@ actor LevelStatsManager {
     
     
     // Обрабатываем трейд (вызывать из TradingEngine при каждом трейде)
-    func procesTrade(trade: TradeStreams) {
+    func procesTrade(trade: TradeStreams) async {
         // 1. Ищем кластер по ФИЗИЧЕСКИМ границам
         guard let cluster = lastClusters.first(where: {
             trade.price >= $0.lowerBound && trade.price <= $0.upperBound
@@ -50,14 +49,14 @@ actor LevelStatsManager {
         switch cluster.side {
         case .bid: // Уровень поддержки (Лимитные покупки)
             if isAggressiveSell {
-                stats.attackerVolume += trade.quantity // Продавец бьет в лимиты покупок
+                await stats.addAttackerVolume(trade.quantity, at: Date()) // Продавец бьет в лимиты покупок
             } else if isAggressiveBuy {
                 stats.defenderVolume += trade.quantity // Рыночный покупатель помогает защищать
             }
             
         case .ask: // Уровень сопротивления (Лимитные продажи)
             if isAggressiveBuy {
-                stats.attackerVolume += trade.quantity // Покупатель бьет в лимиты продаж
+                await stats.addAttackerVolume(trade.quantity, at: Date()) // Покупатель бьет в лимиты продаж
             } else if isAggressiveSell {
                 stats.defenderVolume += trade.quantity // Рыночный продавец помогает защищать
             }

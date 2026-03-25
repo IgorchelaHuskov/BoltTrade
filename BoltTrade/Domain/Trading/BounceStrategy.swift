@@ -249,7 +249,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         // 5. РАСЧЁТ РЕФИЛЛА
         let currentVol = currentVolume(for: cluster, in: snapshot.book)
         let volumeDecrease = max(0, context.initialVolume - currentVol)
-        let actualMarketHit = snapshot.battleStats[cluster.trackingId]?.attackerVolume ?? 0
+        let actualMarketHit = await snapshot.battleStats[cluster.trackingId]?.recentAttackerVolume ?? 0
         let refilled = max(0, actualMarketHit - volumeDecrease)
 
         if refilled > 0 {
