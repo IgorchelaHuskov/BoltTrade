@@ -7,8 +7,6 @@
 
 import Foundation
 
-
-
 actor BinCalculator {
     
     private let tickSize: Double = 0.1

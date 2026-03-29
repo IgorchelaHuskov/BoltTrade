@@ -20,7 +20,7 @@ actor LevelStatsManager {
         for cluster in clusters {
             let key = cluster.trackingId
             if statsByLevel[key] == nil {
-                statsByLevel[key] = LevelBattleStats(trackingId: key, side: cluster.side, price: cluster.price)
+                statsByLevel[key] = LevelBattleStats(trackingId: key, side: cluster.side, price: cluster.price, totalAttackerVolume: 0)
             }
         }
         

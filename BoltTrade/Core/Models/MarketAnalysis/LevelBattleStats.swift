@@ -13,25 +13,36 @@ struct LevelBattleStats: Sendable {
     let price: Double
     var defenderVolume: Double = 0
     var attackerVolume: Double = 0
+    var totalAttackerVolume: Double = 0
     var lastUpdated: Date = Date()
     var firstSeen: Date = Date()
     
-    // Для расчёта рефилла
     var attackerVolumeHistory: [(volume: Double, timestamp: Date)] = []
     let historyWindowSeconds: TimeInterval = 60
     
     mutating func addAttackerVolume(_ volume: Double, at time: Date) {
         attackerVolumeHistory.append((volume, time))
-        attackerVolume += volume
+        totalAttackerVolume += volume  // добавляем к накопленному
         
-        // Удаляем старые записи
-        attackerVolumeHistory = attackerVolumeHistory.filter {
-            time.timeIntervalSince($0.timestamp) < historyWindowSeconds
-        }
+        let cutoff = time.addingTimeInterval(-historyWindowSeconds)
+        attackerVolumeHistory = attackerVolumeHistory.filter { $0.timestamp > cutoff }
+        attackerVolume = attackerVolumeHistory.reduce(0) { $0 + $1.volume }
     }
     
     var recentAttackerVolume: Double {
-        return attackerVolumeHistory.reduce(0) { $0 + $1.volume }
+        return attackerVolume
+    }
+    
+    var isAttackerExhausted: Bool {
+        guard attackerVolumeHistory.count >= 3 else { return false }
+        
+        let totalVolume = attackerVolumeHistory.reduce(0) { $0 + $1.volume }
+        let average = totalVolume / Double(attackerVolumeHistory.count)
+        
+        let lastThree = attackerVolumeHistory.suffix(3)
+        let lastThreeAverage = lastThree.reduce(0) { $0 + $1.volume } / 3
+        
+        return lastThreeAverage < average * 0.5
     }
     
     var ratio: Double {
