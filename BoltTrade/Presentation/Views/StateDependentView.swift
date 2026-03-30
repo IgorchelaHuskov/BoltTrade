@@ -12,7 +12,7 @@ struct StateDependentView: View {
     
     var body: some View {
         if let position = ui.positionInfo {
-            OpenPositionView(position: position, currentPrice: ui.price)
+            OpenPositionView(position: position, currentPrice: ui.price, message: ui.statusMessage)
         } else if let target = ui.targetCluster {
             if target.hasTouched {
                 BattleMonitoringView(target: target, message: ui.statusMessage)

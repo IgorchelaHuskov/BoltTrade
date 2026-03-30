@@ -11,6 +11,7 @@ import SwiftUI
 struct OpenPositionView: View {
     let position: PositionInfo
     let currentPrice: Double
+    let message: String
     
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
@@ -44,7 +45,9 @@ struct OpenPositionView: View {
             
             if let encounter = position.encounterCluster {
                 SectionHeader(title: "ПРЕПЯТСТВИЕ ВПЕРЕДИ", color: .red)
-                CompactClusterInfo(cluster: encounter)
+                //CompactClusterInfo(cluster: encounter)
+                BattleMonitoringView(target: encounter, message: message)
+                
             }
         }
         .padding()
