@@ -666,13 +666,9 @@ actor BounceStrategy: TradingStrategy, Resettable {
         let defenderVol = stats.defenderVolume
         let currentLimit = currentVolume(for: cluster, in: book)
         
-        // 1. Проверка на "Пустоту"
-        if attackerVol < Constants.attackerMinVolume {
-            return .pending
-        }
         
         // 2. Тройной фильтр выживания (поражение)
-        let isLimitDepleted = currentLimit < (initialVolume * Constants.minRemainingLimitRatio)
+        let isLimitDepleted = currentLimit < (initialVolume * Constants.volumeStability)
         let isDefenseOverwhelmed = attackerVol > (defenderVol * 2.0) && attackerVol > 2.0
         
         if isLimitDepleted || isDefenseOverwhelmed {
@@ -707,10 +703,35 @@ actor BounceStrategy: TradingStrategy, Resettable {
             log("🐢 Низкая скорость подхода: \(String(format: "%.2f", velocity))%/с, стандартные требования \(requiredRatio)")
         }
         
+        // --- ФИЛЬТР ГЛУБИНЫ (PENETRATION) ---
+        let levelTop = cluster.upperBound
+        let levelBottom = cluster.lowerBound
+        let levelWidth = levelTop - levelBottom
+
+        // На сколько цена зашла внутрь уровня (в пунктах)
+        let penetrationAbs: Double
+        if cluster.side == .ask {
+            // Для Ask: насколько цена ВЫШЕ нижней границы
+            penetrationAbs = max(0, snapshot.currentPrice - levelBottom)
+        } else {
+            // Для Bid: насколько цена НИЖЕ верхней границы
+            penetrationAbs = max(0, levelTop - snapshot.currentPrice)
+        }
+
+        // Переводим в проценты от ширины кластера
+        let penetrationPercent = (penetrationAbs / (levelWidth > 0 ? levelWidth : 1.0)) * 100
+
+        // Если цена прошила более 60% ширины кластера — это ПРЕД-ПРОБОЙ. Уходим.
+        if penetrationPercent > 60.0 {
+            log("🚩 Глубокое проникновение: \(String(format: "%.1f", penetrationPercent))% уровня пробито. Отмена.")
+            return .lose
+        }
+
+        
         // 5. ИСТОЩЕНИЕ АГРЕССОРА
         let isExhausted = await stats.isAttackerExhausted
         if isExhausted {
-            log("😫 [\(cluster.trackingId)] АГРЕССОР ИСТОЩЁН! Последние атаки слабее среднего на 50%+")
+            log("😫 [\(cluster.trackingId)] АГРЕССОР ИСТОЩЁН! Последние атаки слабее среднего ")
         }
         
         // 6. МИКРООТСКОП
@@ -723,8 +744,10 @@ actor BounceStrategy: TradingStrategy, Resettable {
         }
         
         // 7. УСЛОВИЕ ПОБЕДЫ
+        let battleIsReal = stats.totalAttackerVolume > max(initialVolume * 0.05, 3.0)
         let isStrongDefense = armorRatio >= requiredRatio && !isLimitDepleted
-        let hasStrongSignal = isStrongDefense || isExhausted
+        let hasStrongSignal = (isStrongDefense && isExhausted) && battleIsReal
+       
         
         if rebounded && hasStrongSignal {
             log("✅ [\(cluster.trackingId)] ПОБЕДА!")

@@ -34,16 +34,21 @@ struct LevelBattleStats: Sendable {
     }
     
     var isAttackerExhausted: Bool {
-        guard attackerVolumeHistory.count >= 3 else { return false }
+        guard attackerVolumeHistory.count >= 6 else { return false }
         
-        let totalVolume = attackerVolumeHistory.reduce(0) { $0 + $1.volume }
-        let average = totalVolume / Double(attackerVolumeHistory.count)
+        let lastThree = attackerVolumeHistory.suffix(3).reduce(0) { $0 + $1.volume }
+        let prevThree = attackerVolumeHistory.dropLast(3).suffix(3).reduce(0) { $0 + $1.volume }
         
-        let lastThree = attackerVolumeHistory.suffix(3)
-        let lastThreeAverage = lastThree.reduce(0) { $0 + $1.volume } / 3
+        // 1. Агрессия должна реально упасть относительно предыдущего момента
+        let isSlowingDown = lastThree < (prevThree * 0.4)
         
-        return lastThreeAverage < average * 0.5
+        // 2. ЗАЩИТА: Если общая агрессия ничтожна ,
+        // это не истощение, а "разведка". Не считаем это сигналом.
+        let isSignificantAttack = totalAttackerVolume > 3.0 // Минимум 3 BTC для битка
+        
+        return isSlowingDown && isSignificantAttack
     }
+
     
     var ratio: Double {
         defenderVolume > 0 ? attackerVolume / defenderVolume : attackerVolume

@@ -111,14 +111,19 @@ actor OrderBookClusterer {
         clusterDict.compactMap { (binLow, volumes) -> Cluster? in
             let isPriceInside = currentPrice >= binLow && currentPrice <= (binLow + binSizeAbs)
             
-            // 1. Определяем сторону (Side) с учетом истории
+            /*// 1. Определяем сторону (Side) с учетом истории
             let sideResult = determineSide(binLow: binLow, bidVol: volumes.bid, askVol: volumes.ask)
             let side = sideResult.side
+             */
+            // 1. Определяем сторону (Side) строго по географии относительно цены
+            let clusterMidPrice = binLow + binSizeAbs / 2.0
+            let side: Side = clusterMidPrice < currentPrice ? .bid : .ask
             
             // 2. Расчеты метрик и создание Cluster .
             let dominantVol = isPriceInside ? (volumes.bid + volumes.ask) : (side == .bid ? volumes.bid : volumes.ask) // Считаем доминанту (если цена внутри — берем суммарный вес "битвы")
             let totalSideVol = side == .bid ? totalBidVol : totalAskVol
             let volumeShare = (dominantVol / totalSideVol) * 100
+            
             let stats = side == .bid ? bidStats : askStats
             let zScore = stats.stdev > 0 ? max(0, (dominantVol - stats.mean) / stats.stdev) : 0
             let rawPressure = (volumes.bid + volumes.ask) > 0 ? abs(volumes.bid - volumes.ask) / (volumes.bid + volumes.ask) : 0
