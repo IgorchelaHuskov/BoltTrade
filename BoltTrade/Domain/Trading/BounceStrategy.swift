@@ -21,7 +21,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         // Поиск цели
         static let maxDistancePercentForTarget = 1.0
         static let minFinalStrength            = 0.1
-        static let maxDistanceToCluster        = 0.01
+        static let maxDistanceToCluster        = 0.1
         
         // Мониторинг
         static let thinPathThreshold                = 3.3       // Тонкий путь (thin path)
@@ -75,6 +75,8 @@ actor BounceStrategy: TradingStrategy, Resettable {
     struct Position {
         let entryPrice: Double
         let sourceClusterId: Double
+        let sourceLowerBound: Double
+        let sourceUpperBound: Double
         let initialVolume: Double
         let power: Double
         let side: Side
@@ -101,22 +103,25 @@ actor BounceStrategy: TradingStrategy, Resettable {
         case positionOpen(Position)
     }
     
-    enum EncounterMonitoringResult {
-        case continueMonitoring(MonitoringContext)
-        case exitPosition
-        case stopMonitoring
-    }
-    
     enum BattleOutcome {
         case win
         case lose
         case pending
     }
     
-    enum ExpectedOutcome {
-        case shouldBeStrong
-        case shouldBeWeak
+    enum ClusterStatus {
+        case confirming(MonitoringContext)      // Набираем сэмплы
+        case active(MonitoringContext)          // Объем подтвержден, ждем касания/битвы
+        case battlePending(MonitoringContext)   // Идет активная битва
+        case bounceConfirmed(MonitoringContext) // ОТСКОК (то, что раньше было Win)
+        case broken(String)                     // Уровень уничтожен/пробит (то, что раньше вызывало reset)
     }
+    
+    private enum EvaluationMode {
+        case entry      // для поиска входа
+        case protective // для защитного кластера в позиции
+    }
+
     
     // MARK: - Протокол TradingStrategy
     func analyze(marketSnapshot: MarketSnapshot) async -> Signal? {
@@ -167,157 +172,27 @@ actor BounceStrategy: TradingStrategy, Resettable {
     
     
     private func handleMonitoring(context: MonitoringContext, snapshot: MarketSnapshot) async -> Signal? {
-        var context = context
-        let cluster = context.cluster
+        let status = await evaluateCluster(context: context, snapshot: snapshot, mode: .entry)
         
-        // 1. подтверждения обьема
-        if !context.isConfirmed {
-            // Проверяем, существует ли кластер
-            guard clusterExists(cluster, in: snapshot) else {
+        switch status {
+        case .confirming(let ctx), .active(let ctx), .battlePending(let ctx):
+            state = .monitoring(ctx)
+            return nil
+            
+        case .broken:
+            await reset()
+            return nil
+            
+        case .bounceConfirmed(let ctx):
+            guard let rr = calculateRR(currentCluster: ctx.cluster, currentPrice: snapshot.currentPrice, allClusters: snapshot.clusters, minStrength: Constants.minFinalStrength),
+                  rr.ratio >= 2.0 else {
                 await reset()
                 return nil
             }
             
-            // Проверяем, не ушла ли цена слишком далеко
-            let distance = abs(snapshot.currentPrice - cluster.price) / cluster.price
-            if distance > Constants.maxDistanceToCluster {
-                await reset()
-                return nil
-            }
-            
-            // Собираем замеры объёма
-            let currentVol = currentVolume(for: cluster, in: snapshot.book)
-            var newSamples = context.volumeSamples
-            newSamples.append(currentVol)
-            context.volumeSamples = newSamples
-            
-            // Проверяем, набрали ли достаточно замеров
-            if newSamples.count >= Constants.confirmationSamplesCount {
-                // Усредняем
-                let totalVolume = newSamples.reduce(0, +)
-                let avgVolume = totalVolume / Double(newSamples.count)
-                context.initialVolume = avgVolume
-                context.isConfirmed = true
-                context.volumeSamples = []
-            
-                // ОБНОВЛЯЕМ СОСТОЯНИЕ с подтверждённым контекстом
-                state = .monitoring(context)
-                // Продолжаем выполнение в основную логику
-            } else {
-                // Ещё не набрали, сохраняем и выходим
-                state = .monitoring(context)
-                return nil
-            }
-        }
-        
-        // 2. Проверка существования кластера
-        guard clusterExists(cluster, in: snapshot) else {
-            logClusterRemoved(cluster.trackingId)
-            await reset()
-            return nil
-        }
-        
-        // 3. Базовые условия (дистанция и тонкий путь)
-        guard isDistanceAcceptable(price: snapshot.currentPrice, cluster: cluster),
-              isThinPath(cluster: cluster) else {
-            logBasicConditionsFailed(cluster, price: snapshot.currentPrice)
-            await reset()
-            return nil
-        }
-        
-        // 4. Проверка пробоя
-        if isClusterBroken(cluster, by: snapshot.currentPrice) {
-            logBreakthrough(cluster, price: snapshot.currentPrice)
-            await reset()
-            return nil
-        }
-        
-        // 5. Обновляем последние значения объёма и атак (без рефилла)
-        let currentVol = currentVolume(for: cluster, in: snapshot.book)
-        let currentTotalAttacker = snapshot.battleStats[cluster.trackingId]?.totalAttackerVolume ?? 0
-        
-        // Обновляем сохранённые значения
-        context.lastTotalAttackerVolume = currentTotalAttacker
-        context.lastVolume = currentVol
-        
-        // 6. Стабильность объёма
-        let volumeStatus = checkVolumeStability(cluster: cluster,
-                                                currentVolume: currentVolume(for: cluster, in: snapshot.book),
-                                                initialVolume: context.initialVolume,
-                                                battleStats: snapshot.battleStats[cluster.trackingId])
-        switch volumeStatus {
-        case .critical:
-            logCriticalVolumeDrop(cluster)
-            await reset()
-            return nil
-        case .pause:
-            return nil
-        case .ok:
-            break
-        }
-        
-        // 7. Фиксация касания
-        if !context.hasTouched && didTouchLevelWithHysteresis(cluster: cluster, price: snapshot.currentPrice) {
-            context.hasTouched = true
-            state = .monitoring(context)
-            logTouch(cluster, price: snapshot.currentPrice)
-        }
-        
-        guard context.hasTouched else { return nil }
-        
-        // 8. Защита от спуфинга
-        guard await noVolatilitySpike(currentCluster: cluster, price: snapshot.currentPrice, book: snapshot.book) else {
-            await reset()
-            return nil
-        }
-        
-        // 9. Анализ битвы
-        guard let battleStats = snapshot.battleStats[cluster.trackingId] else {
-            return nil
-        }
-        
-        let battleOutcome = await checkBattleConditions(stats: battleStats,
-                                                        cluster: cluster,
-                                                        book: snapshot.book,
-                                                        initialVolume: context.initialVolume,
-                                                        context: context,
-                                                        snapshot: snapshot)
-        
-        switch battleOutcome {
-        case .lose:
-            await reset()
-            return nil
-        case .pending:
-            logBattlePending(cluster, stats: battleStats, currentVolume: currentVolume(for: cluster, in: snapshot.book))
-            return nil
-        case .win:
-            break // продолжаем
-        }
-        
-        // 10. Проверка выхода цены из зоны (пружина)
-        if isBouncingOffWithHysteresis(cluster: cluster, price: snapshot.currentPrice) {
-            // Проверяем свободный путь и риск/прибыль
-            guard let rr = calculateRR(currentCluster: cluster, currentPrice: snapshot.currentPrice, allClusters: snapshot.clusters, minStrength: Constants.minFinalStrength) else {
-                logNoFreePath(cluster)
-                await reset()
-                return nil
-            }
-            
-            // Минимальное приемлемое соотношение
-            let minRatio = 2.0
-            guard rr.ratio >= minRatio else {
-                logLowRiskReward(cluster, ratio: rr.ratio)
-                await reset()
-                return nil
-            }
-            
-            let position = createPosition(from: cluster, entryPrice: snapshot.currentPrice, context: context, stopPrice: rr.stopPrice)
-            logSignalFormed(cluster, position: position, snapshot: snapshot, currentVolume: currentVolume(for: cluster, in: snapshot.book))
+            let position = createPosition(from: ctx.cluster, entryPrice: snapshot.currentPrice, context: ctx, stopPrice: rr.stopPrice)
             state = .positionOpen(position)
-            return (cluster.side == .bid) ? .buy : .sell
-        } else {
-            logWaitingForBounce(cluster)
-            return nil
+            return (ctx.cluster.side == .bid) ? .buy : .sell
         }
     }
     
@@ -333,18 +208,18 @@ actor BounceStrategy: TradingStrategy, Resettable {
             return .exit
         }
         
-        // 2. Жесткий Тейк-профит 1%
-        let takeProfitPercent: Double = 0.01 // 1%
+        // 2. Жесткий Тейк-профит 3%
+        let takeProfitPercent: Double = 0.03 // 3%
         let isTakeProfitHit: Bool
-            
+        
         if position.side == .bid {
-            // Для лонга: цена входа + 1%
+            // Для лонга: цена входа + 3%
             isTakeProfitHit = price >= position.entryPrice * (1.0 + takeProfitPercent)
         } else {
-            // Для шорта: цена входа - 1%
+            // Для шорта: цена входа - 3%
             isTakeProfitHit = price <= position.entryPrice * (1.0 - takeProfitPercent)
         }
-
+        
         if isTakeProfitHit {
             log("💰 [TP 1%] Цель достигнута по цене \(price). Закрываем профит.")
             addTradeToHistory(entryPosition: position, exitPrice: price, exitDate: Date(), whyClosePosition: "Take Profit 1%")
@@ -352,73 +227,165 @@ actor BounceStrategy: TradingStrategy, Resettable {
             return .exit
         }
         
-        // --- Мониторинг встречного кластера ---
-        let nearestEncounter = findNextEncounterCluster(for: position.side, currentPrice: price, allClusters: snapshot.clusters)
-
-        if let encContext = position.encounterMonitoringContext {
-            // Активный контекст есть – проверяем, актуален ли он
-            let cluster = encContext.cluster
-            
-            // 1. Существует ли кластер в книге?
-            guard snapshot.clusters.contains(where: { $0.trackingId == cluster.trackingId }) else {
-                // Кластер исчез – сбрасываем контекст
-                position.encounterMonitoringContext = nil
-                log("🗑️ [\(cluster.trackingId)-\(cluster.side)] Встречный кластер исчез из книги, мониторинг остановлен")
+        // Ищем защитника (своя сторона)
+        let nearestProtective = findProtectiveCluster(for: position.side,
+                                                      currentPrice: snapshot.currentPrice,
+                                                      allClusters: snapshot.clusters,
+                                                      excludeId: position.sourceClusterId,
+                                                      excludeLower: position.sourceLowerBound,
+                                                      excludeUpper: position.sourceUpperBound)
+        
+        // Если мониторинг уже идет
+        if let ctx = position.encounterMonitoringContext {
+            // ПРОВЕРКА НА ПЕРЕКЛЮЧЕНИЕ:
+            // Если появился кластер ближе, чем тот, что мы мониторим сейчас
+            if let newNearest = nearestProtective, newNearest.trackingId != ctx.cluster.trackingId {
+                log("🔄 Смена щита: найден более близкий кластер \(newNearest.trackingId)")
+                position.encounterMonitoringContext = createNewContext(for: newNearest, snapshot: snapshot)
+                position.processedClusterIds.insert(newNearest.trackingId)
                 state = .positionOpen(position)
-                return nil
+                return nil // Выходим, чтобы на следующем тике начать evaluate уже нового контекста
             }
             
-            // 2. Не ушла ли цена за пределы кластера в сторону позиции (угроза миновала)?
-            let isMovingInFavor = (position.side == .bid && price > cluster.upperBound) ||
-                                  (position.side == .ask && price < cluster.lowerBound)
-            if isMovingInFavor {
-                position.encounterMonitoringContext = nil
-                log("✅ [\(cluster.trackingId)-\(cluster.side)] Цена вышла из встречного кластера в сторону позиции, угроза снята")
-                state = .positionOpen(position)
-                return nil
-            }
+            let status = await evaluateCluster(context: ctx, snapshot: snapshot, mode: .protective)
             
-            // Контекст актуален – продолжаем мониторинг
-            let result = await monitorEncounterCluster(context: encContext, snapshot: snapshot, positionSide: position.side, position: position)
-            switch result {
-            case .continueMonitoring(let updatedContext):
-                position.encounterMonitoringContext = updatedContext
+            switch status {
+            case .confirming(let newCtx), .active(let newCtx), .battlePending(let newCtx):
+                position.encounterMonitoringContext = newCtx
                 state = .positionOpen(position)
-            case .exitPosition:
+                
+            case .broken:
+                // ДЛЯ ЗАЩИТЫ: Если уровень пал, мы ВЫХОДИМ из позиции
+                log("Защитный уровень пробит! Закрываем позицию.")
+                addTradeToHistory(entryPosition: position, exitPrice: price, exitDate: Date(), whyClosePosition: "Защитный уровень пробит!")
                 await reset()
                 return .exit
-            case .stopMonitoring:
-                position.encounterMonitoringContext = nil
+                
+            case .bounceConfirmed:
+                // Уровень отработал, цена ушла в нашу сторону
+                log("Защита отскочила, сидим дальше")
+                position.encounterMonitoringContext = nil // Сбрасываем мониторинг до следующей коррекции
                 state = .positionOpen(position)
             }
-        } else {
-            // Нет активного контекста – инициализируем новый, если есть ближайший и он ещё не обработан
-            if let encounter = nearestEncounter, !position.processedClusterIds.contains(encounter.trackingId) {
-                let initialVol = currentVolume(for: encounter, in: snapshot.book)
-                let newContext = MonitoringContext(
-                    cluster: encounter,
-                    startTime: .now,
-                    initialVolume: initialVol,
-                    volumeSamples: [initialVol],
-                    firstSeenAt: .now,
-                    firstSeenPrice: price,
-                    lastTotalAttackerVolume: snapshot.battleStats[encounter.trackingId]?.totalAttackerVolume ?? 0,
-                    lastVolume: initialVol
-                )
-                position.encounterMonitoringContext = newContext
-                state = .positionOpen(position)
-                logEncounterMonitoringStarted(encounter)
-            } else {
-                // Нет подходящего встречного кластера – обнуляем мониторинг
-                position.encounterMonitoringContext = nil
-                state = .positionOpen(position)
-            }
+            
+        } else if let protective = nearestProtective, !position.processedClusterIds.contains(protective.trackingId) {
+            // Помечаем, что мы взяли этот кластер в работу
+            position.processedClusterIds.insert(protective.trackingId)
+            position.encounterMonitoringContext = createNewContext(for: protective, snapshot: snapshot)
+            logEncounterMonitoringStarted(protective)
+            state = .positionOpen(position)
+            
+        } else if position.encounterMonitoringContext != nil {
+            position.encounterMonitoringContext = nil
+            state = .positionOpen(position)
         }
-        
+
         return nil
     }
     
     // MARK: - Вспомогательные методы (логика проверок)
+    
+    private func evaluateCluster(context: MonitoringContext,
+                                 snapshot: MarketSnapshot,
+                                 mode: EvaluationMode) async -> ClusterStatus {
+        var context = context
+        let cluster = context.cluster
+        let price = snapshot.currentPrice
+        
+        // ========== 1. Существование и дистанция (только entry) ==========
+        if mode == .entry {
+            guard clusterExists(cluster, in: snapshot) else {
+                return .broken("Cluster removed")
+            }
+            if cluster.distancePercent > Constants.maxDistanceToCluster {
+                return .broken("Price too far")
+            }
+        }
+        
+        // ========== 2. Подтверждение объёма ==========
+        if !context.isConfirmed {
+            if mode == .protective {
+                // Для защитного кластера сразу считаем подтверждённым, берём текущий объём
+                context.isConfirmed = true
+                context.initialVolume = currentVolume(for: cluster, in: snapshot.book)
+            } else {
+                let currentVol = currentVolume(for: cluster, in: snapshot.book)
+                context.volumeSamples.append(currentVol)
+                if context.volumeSamples.count >= Constants.confirmationSamplesCount {
+                    context.initialVolume = context.volumeSamples.reduce(0, +) / Double(context.volumeSamples.count)
+                    context.isConfirmed = true
+                    context.volumeSamples = []
+                    return .active(context)
+                }
+                return .confirming(context)
+            }
+        }
+        
+        // ========== 3. Базовые условия и пробой ==========
+        if mode == .entry {
+            if !isDistanceAcceptable(price: price, cluster: cluster) || !isThinPath(cluster: cluster) {
+                return .broken("Basic conditions failed")
+            }
+        }
+        
+        // Пробой уровня – критично для обоих режимов
+        if isClusterBroken(cluster, by: price) {
+            return .broken("Breakthrough")
+        }
+        
+        // ========== 4. Стабильность объёма ==========
+        let currentVol = currentVolume(for: cluster, in: snapshot.book)
+        let stats = snapshot.battleStats[cluster.trackingId]
+        let volStatus = checkVolumeStability(cluster: cluster,
+                                             currentVolume: currentVol,
+                                             initialVolume: context.initialVolume,
+                                             battleStats: stats)
+        if case .critical = volStatus {
+            return .broken("Volume drop")
+        }
+        
+        // Обновляем контекст
+        context.lastVolume = currentVol
+        context.lastTotalAttackerVolume = stats?.totalAttackerVolume ?? 0
+        
+        // ========== 5. Касание уровня ==========
+        if mode == .protective {
+            // Для защиты считаем, что касание уже было (или не нужно)
+            context.hasTouched = true
+        } else {
+            if !context.hasTouched && didTouchLevelWithHysteresis(cluster: cluster, price: price) {
+                context.hasTouched = true
+            }
+            guard context.hasTouched else {
+                return .active(context)
+            }
+        }
+        
+        // ========== 6. Защита от волатильности и анализ битвы ==========
+        // Для protective можно также пропустить noVolatilitySpike (опционально),
+        // но оставим общую проверку для единообразия.
+        guard await noVolatilitySpike(currentCluster: cluster, price: price, book: snapshot.book),
+              let battleStats = stats else { return .battlePending(context) }
+        
+        let battleOutcome = await checkBattleConditions(stats: battleStats,
+                                                        cluster: cluster,
+                                                        book: snapshot.book,
+                                                        initialVolume: context.initialVolume,
+                                                        context: context,
+                                                        snapshot: snapshot)
+        
+        switch battleOutcome {
+        case .lose:
+            return .broken("Battle lost")
+        case .pending:
+            return .battlePending(context)
+        case .win:
+            if isBouncingOffWithHysteresis(cluster: cluster, price: price) {
+                return .bounceConfirmed(context)
+            }
+            return .battlePending(context)
+        }
+    }
     
     // Проверка: цена находится СНАРУЖИ уровня (с гистерезисом)
     private func isOutsideLevelWithHysteresis(cluster: Cluster, price: Double) -> Bool {
@@ -453,31 +420,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
             // Отскок от сопротивления: цена вышла НИЖЕ нижней границы - отступ
             return price < cluster.lowerBound - (Constants.tickSize * Double(Constants.hysteresisTicks))
         }
-    }
-    
-    private func calculateTrailingStop(position: Position, currentPrice: Double) -> Double? {
-        let isLong = position.side == .bid
-        
-        // Процент чистого движения цены от входа
-        let priceMovePercent = (currentPrice - position.entryPrice) / position.entryPrice * (isLong ? 1 : -1)
-        
-        // Цена "истинного" безубытка (Break-even Price)
-        let breakEvenPrice = isLong
-            ? position.entryPrice * (1 + Constants.totalCosts)
-            : position.entryPrice * (1 - Constants.totalCosts)
-        
-        // Проверка: мы уже перевели стоп в БУ?
-        let isAlreadyInSafeZone = isLong
-            ? position.stopLoss >= (breakEvenPrice - 0.0001)
-            : position.stopLoss <= (breakEvenPrice + 0.0001)
-        
-        // А) ПЕРЕВОД В БЕЗУБЫТОК
-        if !isAlreadyInSafeZone && priceMovePercent >= Constants.breakEvenActivation {
-            log("🛡 БЕЗУБЫТОК: Цена прошла \(String(format: "%.2f", priceMovePercent * 100))%. Ставим стоп на покрытие комиссий.")
-            return breakEvenPrice
-        }
-        
-        return nil
     }
     
     private func calculateRR(currentCluster: Cluster,
@@ -629,7 +571,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
             log("🐢 Низкая скорость подхода: \(String(format: "%.2f", velocity))%/с, стандартные требования \(requiredRatio)")
         }
         
-        
         // 5. ИСТОЩЕНИЕ АГРЕССОРА
         let isExhausted = await stats.isAttackerExhausted
         if isExhausted {
@@ -667,134 +608,8 @@ actor BounceStrategy: TradingStrategy, Resettable {
         log("⏳ [\(cluster.trackingId)] Ожидание... armorRatio: \(String(format: "%.2f", armorRatio)) < \(String(format: "%.2f", requiredRatio))")
         return .pending
     }
-
     
-    private func checkLevelHealth(cluster: Cluster,
-                                  snapshot: MarketSnapshot,
-                                  initialVol: Double,
-                                  context: MonitoringContext) async -> Bool {
-        // Пробой — смерть
-        if isClusterBroken(cluster, by: snapshot.currentPrice) {
-            return false
-        }
         
-        // Если есть данные битвы — проверяем исход
-        if let stats = snapshot.battleStats[cluster.trackingId] {
-            let outcome = await checkBattleConditions(stats: stats,
-                                                      cluster: cluster,
-                                                      book: snapshot.book,
-                                                      initialVolume: initialVol,
-                                                      context: context,
-                                                      snapshot: snapshot)
-            if outcome == .lose {
-                return false
-            }
-        }
-        
-        return true
-    }
-    
-    
-    private func monitorEncounterCluster(context: MonitoringContext, snapshot: MarketSnapshot, positionSide: Side, position: Position) async -> EncounterMonitoringResult {
-        var context = context
-        let cluster = context.cluster
-        let currentPrice = snapshot.currentPrice
-        
-        // 1. Накопление сэмплов до подтверждения
-        if !context.isConfirmed {
-            guard clusterExists(cluster, in: snapshot) else {
-                return .stopMonitoring
-            }
-            let distance = abs(currentPrice - cluster.price) / cluster.price
-            if distance > Constants.maxDistanceToCluster {
-                return .stopMonitoring
-            }
-            
-            let currentVol = currentVolume(for: cluster, in: snapshot.book)
-            var newSamples = context.volumeSamples
-            newSamples.append(currentVol)
-            context.volumeSamples = newSamples
-            // Обновляем last поля, чтобы после подтверждения они были актуальны
-            context.lastVolume = currentVol
-            context.lastTotalAttackerVolume = snapshot.battleStats[cluster.trackingId]?.totalAttackerVolume ?? 0
-            
-            if newSamples.count >= Constants.confirmationSamplesCount {
-                let totalVolume = newSamples.reduce(0, +)
-                let avgVolume = totalVolume / Double(newSamples.count)
-                context.initialVolume = avgVolume
-                context.isConfirmed = true
-                context.volumeSamples = []
-            }
-            return .continueMonitoring(context)
-        }
-        
-        // 2. Проверки после подтверждения
-        guard clusterExists(cluster, in: snapshot) else {
-            logClusterRemoved(cluster.trackingId)
-            return .stopMonitoring
-        }
-        
-        let distance = abs(currentPrice - cluster.price) / cluster.price
-        if distance > Constants.maxDistanceToCluster {
-            return .stopMonitoring
-        }
-        
-        // Пробой уровня
-        if isClusterBroken(cluster, by: currentPrice) {
-            logBreakthrough(cluster, price: currentPrice)
-            return .stopMonitoring
-        }
-        
-        // Если цена уже ушла за пределы кластера в сторону позиции – уровень больше не угрожает
-        let isMovingInFavor = (positionSide == .bid && currentPrice > cluster.upperBound) ||
-                              (positionSide == .ask && currentPrice < cluster.lowerBound)
-        if isMovingInFavor {
-            return .stopMonitoring
-        }
-        
-        // 3. Обновляем последние значения (без рефилла)
-        let currentVol = currentVolume(for: cluster, in: snapshot.book)
-        let currentTotalAttacker = snapshot.battleStats[cluster.trackingId]?.totalAttackerVolume ?? 0
-        context.lastTotalAttackerVolume = currentTotalAttacker
-        context.lastVolume = currentVol
-        
-        // 4. Фиксация касания (если цена вошла в зону)
-        if !context.hasTouched {
-            if (positionSide == .bid && currentPrice >= cluster.lowerBound) ||
-               (positionSide == .ask && currentPrice <= cluster.upperBound) {
-                context.hasTouched = true
-                return .continueMonitoring(context)
-            }
-        }
-        guard context.hasTouched else { return .continueMonitoring(context) }
-        
-        // 5. Анализ битвы
-        guard let battleStats = snapshot.battleStats[cluster.trackingId] else {
-            return .continueMonitoring(context)
-        }
-        
-        let battleOutcome = await checkBattleConditions(stats: battleStats,
-                                                        cluster: cluster,
-                                                        book: snapshot.book,
-                                                        initialVolume: context.initialVolume,
-                                                        context: context,
-                                                        snapshot: snapshot)
-        
-        switch battleOutcome {
-        case .lose:
-            // Кластер пробит – угрозы нет
-            return .stopMonitoring
-        case .pending:
-            // Битва продолжается – ждём
-            return .continueMonitoring(context)
-        case .win:
-            let whyClosePosition = logEncounterBattleUnexpected(cluster)
-            addTradeToHistory(entryPosition: position, exitPrice: snapshot.currentPrice, exitDate: Date(), whyClosePosition: whyClosePosition)
-            return .exitPosition
-        }
-    }
-    
-    
     // MARK: - Поиск цели
     func findTargetCluster(in snapshot: MarketSnapshot) -> Cluster? {
         let currentPrice = snapshot.currentPrice
@@ -815,29 +630,46 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     
-    private func findNextEncounterCluster(for side: Side, currentPrice: Double, allClusters: [Cluster]) -> Cluster? {
+    private func findProtectiveCluster(for side: Side,
+                                       currentPrice: Double,
+                                       allClusters: [Cluster],
+                                       excludeId: Double,
+                                       excludeLower: Double,
+                                       excludeUpper: Double) -> Cluster? {
         let isLong = side == .bid
+        let maxDistance = 0.002
+        let epsilon = 1e-8
+
         let relevant = allClusters.filter { cluster in
+            // 1. Исключаем по ID
+            guard cluster.trackingId != excludeId else { return false }
+
+            // 2. Исключаем кластеры, перекрывающиеся с исходным диапазоном
+            let overlaps = cluster.lowerBound <= excludeUpper + epsilon &&
+                           cluster.upperBound >= excludeLower - epsilon
+            guard !overlaps else { return false }
+
+            // 3. Условия по стороне и расстоянию
             if isLong {
-                // LONG: ищем ask-кластеры, которые находятся выше текущей цены
-                return cluster.side == .ask && cluster.lowerBound > currentPrice
+                guard cluster.side == .bid && cluster.upperBound < currentPrice else { return false }
+                let distance = (currentPrice - cluster.upperBound) / currentPrice
+                return distance <= maxDistance && cluster.strength > Constants.minFinalStrength
             } else {
-                // SHORT: ищем bid-кластеры, которые находятся ниже текущей цены
-                return cluster.side == .bid && cluster.upperBound < currentPrice
+                guard cluster.side == .ask && cluster.lowerBound > currentPrice else { return false }
+                let distance = (cluster.lowerBound - currentPrice) / currentPrice
+                return distance <= maxDistance && cluster.strength > Constants.minFinalStrength
             }
         }
-        
-        // Сортируем по расстоянию до цены (ближайший)
-        let sorted = relevant.sorted { lhs, rhs in
+
+        return relevant.sorted { lhs, rhs in
             if isLong {
-                return lhs.lowerBound < rhs.lowerBound
-            } else {
                 return lhs.upperBound > rhs.upperBound
+            } else {
+                return lhs.lowerBound < rhs.lowerBound
             }
-        }
-        return sorted.first
+        }.first
     }
-    
+
     
     // MARK: - Утилиты
     private func currentVolume(for cluster: Cluster, in book: LocalOrderBook) -> Double {
@@ -862,9 +694,30 @@ actor BounceStrategy: TradingStrategy, Resettable {
         return distance <= Constants.maxDistanceToCluster
     }
     
+    
+    
+    private func createNewContext(for cluster: Cluster, snapshot: MarketSnapshot) -> MonitoringContext {
+        let currentVol = currentVolume(for: cluster, in: snapshot.book)
+        let currentAttacker = snapshot.battleStats[cluster.trackingId]?.totalAttackerVolume ?? 0
+        
+        return MonitoringContext(
+            cluster: cluster,
+            startTime: .now,
+            initialVolume: currentVol,
+            volumeSamples: [currentVol],
+            firstSeenAt: .now,
+            firstSeenPrice: snapshot.currentPrice,
+            lastTotalAttackerVolume: currentAttacker,
+            lastVolume: currentVol
+        )
+    }
+
+    
     private func createPosition(from cluster: Cluster, entryPrice: Double, context: MonitoringContext, stopPrice: Double) -> Position {
         return Position(entryPrice: entryPrice,
                         sourceClusterId: cluster.trackingId,
+                        sourceLowerBound: cluster.lowerBound,
+                        sourceUpperBound: cluster.upperBound,
                         initialVolume: context.initialVolume,
                         power: cluster.strength,
                         side: cluster.side,
@@ -1015,7 +868,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     private func logEncounterMonitoringStarted(_ cluster: Cluster) {
-        log("🔄 [\(cluster.trackingId)-\(cluster.side)] Начат мониторинг встречного кластера.")
+        log("🔄 [\(cluster.trackingId)-\(cluster.side) - \(cluster.upperBound)...\(cluster.lowerBound) ] Начат мониторинг встречного кластера.")
     }
     
     // MARK: Методы для UI

@@ -23,11 +23,11 @@ actor CandleManager {
         self.candleContinuation = continuation
     }
 
-    func start(interval: Int = 15) async throws {
+    func start(interval: Int = 60) async throws {
         task = Task {
             while !Task.isCancelled {
                 do {
-                    let snapshot = try await dataProvider.fetchCandle(limit: 200)
+                    let snapshot = try await dataProvider.fetchCandle(limit: 1000)
                     candleContinuation.yield(snapshot)
                     let sleep = secondsUntilNextCandle(intervalMinutes: interval)
                     try await Task.sleep(for: .seconds(sleep))

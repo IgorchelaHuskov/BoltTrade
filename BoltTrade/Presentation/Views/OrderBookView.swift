@@ -49,7 +49,7 @@ struct ClusterRowView: View {
     
     var body: some View {
         HStack {
-            Text(String(format: "%.2f", row.price)).frame(width: 70, alignment: .leading)
+            Text(String(format: "%.2f", row.id)).frame(width: 70, alignment: .leading)
             Text(String(format: "%.2f", row.volume)).frame(width: 50, alignment: .trailing)
             Text(String(format: "%.1fσ", row.power))
                 .frame(width: 40, alignment: .trailing)
