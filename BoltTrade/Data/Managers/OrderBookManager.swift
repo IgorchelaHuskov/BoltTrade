@@ -40,8 +40,8 @@ actor OrderBookManager {
     private let bookStreamManager: BookStreamManager
     private let bookSnapshotManager: BookSnapshotManager
     
-    private var bidsDict: [Double : Double] = [:]
-    private var asksDict: [Double : Double] = [:]
+    private var bidsDict: [Int : Double] = [:]
+    private var asksDict: [Int : Double] = [:]
     private var lastUpdateId: Int = 0
 
     private var buffer: [OrderBookStreamUpdate] = []
@@ -205,8 +205,8 @@ actor OrderBookManager {
         // ОСОБЫЙ СЛУЧАЙ: если фильтрованный буфер пуст
         if filteredBuffer.isEmpty {
             // Устанавливаем локальную книгу из снимка
-            self.bidsDict = Dictionary(uniqueKeysWithValues: currentSnapshot.bids.map { ($0.price, $0.quantity) })
-            self.asksDict = Dictionary(uniqueKeysWithValues: currentSnapshot.asks.map { ($0.price, $0.quantity) })
+            self.bidsDict = Dictionary(uniqueKeysWithValues: currentSnapshot.bids.map {(Int(($0.price * 100).rounded()), $0.quantity) })
+            self.asksDict = Dictionary(uniqueKeysWithValues: currentSnapshot.asks.map {(Int(($0.price * 100).rounded()), $0.quantity) })
             self.lastUpdateId = currentSnapshot.lastUpdateId
             self.buffer.removeAll()
             self.connectionState = .synchronized
@@ -245,8 +245,8 @@ actor OrderBookManager {
             askLevels.append(level)
         }
 
-        self.bidsDict = Dictionary(uniqueKeysWithValues: currentSnapshot.bids.map { ($0.price, $0.quantity) })
-        self.asksDict = Dictionary(uniqueKeysWithValues: currentSnapshot.asks.map { ($0.price, $0.quantity) })
+        self.bidsDict = Dictionary(uniqueKeysWithValues: currentSnapshot.bids.map {(Int(($0.price * 100).rounded()), $0.quantity) })
+        self.asksDict = Dictionary(uniqueKeysWithValues: currentSnapshot.asks.map {(Int(($0.price * 100).rounded()), $0.quantity) })
         self.lastUpdateId = currentSnapshot.lastUpdateId
         
 
@@ -286,41 +286,44 @@ actor OrderBookManager {
     }
 
     private func createSnapshot() -> LocalOrderBook {
-        // 1. Находим лучшие цены прямо в словарях (без сортировки всего массива!)
-        let bestBidPrice = bidsDict.keys.max() ?? 0.0
-        let bestAskPrice = asksDict.keys.min() ?? 0.0
-        
-        // Если стакан пустой, нет смысла что-то фильтровать
-        guard bestBidPrice > 0, bestAskPrice > 0 else {
+        // 1. Находим экстремумы (они теперь Int)
+        guard let maxBidKey = bidsDict.keys.max(),
+              let minAskKey = asksDict.keys.min() else {
             return LocalOrderBook(bids: [], asks: [], lastUpdateId: lastUpdateId)
         }
 
+        // 2. Считаем midPrice в Double для точности
+        let bestBidPrice = Double(maxBidKey) / 100.0
+        let bestAskPrice = Double(minAskKey) / 100.0
         let midPrice = (bestBidPrice + bestAskPrice) / 2
-        let range = midPrice * 1 // Твои 5%
         
-        // 2. Фильтруем словари ДО тяжелой сортировки
-        // Оставляем только те уровни, которые входят в 5% диапазон
-        let filteredBids = bidsDict
-            .filter { $0.key >= midPrice - range }
-            .map { OrderBookLevel(price: $0.key, quantity: $0.value) }
-            .sorted { $0.price > $1.price }
-            
-        let filteredAsks = asksDict
-            .filter { $0.key <= midPrice + range }
-            .map { OrderBookLevel(price: $0.key, quantity: $0.value) }
-            .sorted { $0.price < $1.price }
+        // 3. Переводим границы фильтрации в Int (один раз!)
+        // Используем 0.05 для 5%
+        let rangeDouble = midPrice * 0.05
+        let lowerBoundKey = Int(((midPrice - rangeDouble) * 100).rounded())
+        let upperBoundKey = Int(((midPrice + rangeDouble) * 100).rounded())
 
+        // 4. Фильтруем (сравнение Int против Int — это очень быстро)
+        let filteredBids = bidsDict
+            .filter { $0.key >= lowerBoundKey }
+            .map { OrderBookLevel(price: Double($0.key) / 100.0, quantity: $0.value) }
+            .sorted { $0.price > $1.price }
+                
+        let filteredAsks = asksDict
+            .filter { $0.key <= upperBoundKey }
+            .map { OrderBookLevel(price: Double($0.key) / 100.0, quantity: $0.value) }
+            .sorted { $0.price < $1.price }
         return LocalOrderBook(bids: filteredBids, asks: filteredAsks, lastUpdateId: lastUpdateId)
     }
 
 
-    
-    private func updateSide(_ dict: inout [Double: Double], with updates: [OrderBookEntryStream]) {
+    private func updateSide(_ dict: inout [Int: Double], with updates: [OrderBookEntryStream]) {
         for update in updates {
+            let priceKey = Int((update.price * 100).rounded())
             if update.quantity == 0 {
-                dict.removeValue(forKey: update.price) // O(1)
+                dict.removeValue(forKey: priceKey) // O(1)
             } else {
-                dict[update.price] = update.quantity // O(1)
+                dict[priceKey] = update.quantity // O(1)
             }
         }
     }

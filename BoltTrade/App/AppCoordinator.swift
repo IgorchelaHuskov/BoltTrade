@@ -62,7 +62,7 @@ final class AppCoordinator {
             
             self.bounce = BounceStrategy()
             
-            self.strategyViewModel = StrategyViewModel(strategy: self.bounce)
+            self.strategyViewModel = StrategyViewModel(strategy: self.bounce, dataProvider: dataProvider)
             
             self.binCalculator = DynamicBinCalculator(dataService: dataService,
                                                       marketStateAnalyzer: marketStateAnalyzer,
@@ -75,7 +75,6 @@ final class AppCoordinator {
                                                 levelStatsManager: levelStatsManager)
     
             self.dataService = dataService
-            
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await self.dataService.start() }
                 group.addTask { await self.tradingService.start() }

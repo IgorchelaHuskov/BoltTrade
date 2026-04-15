@@ -19,9 +19,9 @@ actor BounceStrategy: TradingStrategy, Resettable {
     // MARK: - Константы стратегии
     private enum Constants {
         // Поиск цели
-        static let maxDistancePercentForTarget = 1.0
+        static let maxDistancePercentForTarget = 0.5
         static let minFinalStrength            = 0.1
-        static let maxDistanceToCluster        = 0.1
+        static let maxDistanceToCluster        = 0.3
         
         // Мониторинг
         static let thinPathThreshold                = 3.3       // Тонкий путь (thin path)
@@ -75,8 +75,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
     struct Position {
         let entryPrice: Double
         let sourceClusterId: Double
-        let sourceLowerBound: Double
-        let sourceUpperBound: Double
         let initialVolume: Double
         let power: Double
         let side: Side
@@ -208,15 +206,15 @@ actor BounceStrategy: TradingStrategy, Resettable {
             return .exit
         }
         
-        // 2. Жесткий Тейк-профит 3%
-        let takeProfitPercent: Double = 0.03 // 3%
+        // 2. Жесткий Тейк-профит 1%
+        let takeProfitPercent: Double = 0.03 // 1%
         let isTakeProfitHit: Bool
         
         if position.side == .bid {
-            // Для лонга: цена входа + 3%
+            // Для лонга: цена входа + 1%
             isTakeProfitHit = price >= position.entryPrice * (1.0 + takeProfitPercent)
         } else {
-            // Для шорта: цена входа - 3%
+            // Для шорта: цена входа - 1%
             isTakeProfitHit = price <= position.entryPrice * (1.0 - takeProfitPercent)
         }
         
@@ -228,12 +226,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         }
         
         // Ищем защитника (своя сторона)
-        let nearestProtective = findProtectiveCluster(for: position.side,
-                                                      currentPrice: snapshot.currentPrice,
-                                                      allClusters: snapshot.clusters,
-                                                      excludeId: position.sourceClusterId,
-                                                      excludeLower: position.sourceLowerBound,
-                                                      excludeUpper: position.sourceUpperBound)
+        let nearestProtective = findProtectiveCluster(for: position.side, currentPrice: snapshot.currentPrice, allClusters: snapshot.clusters, excludeId: position.sourceClusterId)
         
         // Если мониторинг уже идет
         if let ctx = position.encounterMonitoringContext {
@@ -297,6 +290,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
             guard clusterExists(cluster, in: snapshot) else {
                 return .broken("Cluster removed")
             }
+            //let distance = abs(price - cluster.price) / cluster.price
             if cluster.distancePercent > Constants.maxDistanceToCluster {
                 return .broken("Price too far")
             }
@@ -630,26 +624,12 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     
-    private func findProtectiveCluster(for side: Side,
-                                       currentPrice: Double,
-                                       allClusters: [Cluster],
-                                       excludeId: Double,
-                                       excludeLower: Double,
-                                       excludeUpper: Double) -> Cluster? {
+    private func findProtectiveCluster(for side: Side, currentPrice: Double, allClusters: [Cluster], excludeId: Double) -> Cluster? {
         let isLong = side == .bid
         let maxDistance = 0.002
-        let epsilon = 1e-8
-
+        
         let relevant = allClusters.filter { cluster in
-            // 1. Исключаем по ID
             guard cluster.trackingId != excludeId else { return false }
-
-            // 2. Исключаем кластеры, перекрывающиеся с исходным диапазоном
-            let overlaps = cluster.lowerBound <= excludeUpper + epsilon &&
-                           cluster.upperBound >= excludeLower - epsilon
-            guard !overlaps else { return false }
-
-            // 3. Условия по стороне и расстоянию
             if isLong {
                 guard cluster.side == .bid && cluster.upperBound < currentPrice else { return false }
                 let distance = (currentPrice - cluster.upperBound) / currentPrice
@@ -660,7 +640,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
                 return distance <= maxDistance && cluster.strength > Constants.minFinalStrength
             }
         }
-
+        
         return relevant.sorted { lhs, rhs in
             if isLong {
                 return lhs.upperBound > rhs.upperBound
@@ -716,8 +696,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
     private func createPosition(from cluster: Cluster, entryPrice: Double, context: MonitoringContext, stopPrice: Double) -> Position {
         return Position(entryPrice: entryPrice,
                         sourceClusterId: cluster.trackingId,
-                        sourceLowerBound: cluster.lowerBound,
-                        sourceUpperBound: cluster.upperBound,
                         initialVolume: context.initialVolume,
                         power: cluster.strength,
                         side: cluster.side,

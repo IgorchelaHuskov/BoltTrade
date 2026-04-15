@@ -75,9 +75,7 @@ actor OrderBookClusterer {
     
     
     // MARK: - Aggregation
-    private func aggregateOrderBook(localOrderBook: LocalOrderBook,
-                                    binSizeAbs: Double) -> (clusterDict: [Double: (bid: Double, ask: Double)],
-                                                            totalBidVol: Double, totalAskVol: Double) {
+    private func aggregateOrderBook(localOrderBook: LocalOrderBook, binSizeAbs: Double) -> (clusterDict: [Double: (bid: Double, ask: Double)], totalBidVol: Double, totalAskVol: Double) {
         var clusterDict: [Double : (bid: Double, ask: Double)] = [:]
         var totalBidVol = 0.0
         var totalAskVol = 0.0

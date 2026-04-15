@@ -59,7 +59,6 @@ actor WebSocketService {
     }
 
     private func listen(urlString: String) async {
-        // Пока этот конкретный URL должен работать
         while isRunning[urlString] == true {
             guard let connection = connections[urlString] else { break }
             
@@ -89,6 +88,22 @@ actor WebSocketService {
                 }
                 break
             }
+        }
+    }
+    
+    func send(urlString: String, data: Data) async {
+        guard let connection = connections[urlString] else { return }
+        
+        // Превращаем JSON-данные в строку
+        guard let jsonString = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        do {
+            // Отправляем как СТРОКУ, а не как DATA
+            try await connection.task.send(.string(jsonString))
+        } catch {
+            print("❌ Ошибка отправки: \(error.localizedDescription)")
         }
     }
 

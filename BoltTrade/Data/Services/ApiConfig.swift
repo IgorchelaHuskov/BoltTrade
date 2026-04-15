@@ -12,6 +12,10 @@ struct APIConfig: Decodable {
     let binanceOrderBookURL: String
     let binanceOrderBookWebsocketURL: String
     let binanceTradeWebsocketURL: String
+    let binancefutureWS: String
+    let binancefutureURL: String
+    let apiKey: String
+    let secretKey: String
     
     // Синглтон для доступа из любой части приложения
     static let shared: APIConfig? = {
