@@ -23,13 +23,14 @@ actor TradingEngine {
     private let orderBookClusterer = OrderBookClusterer()
     private let levelStatsManager: LevelStatsManager
     private let marketStateAnalyzer: MarketStateAnalyzer
+    private let orderManager: OrderManager
     
     private var tradeTask: Task<Void, Never>?
     private var bookTask: Task<Void, Never>?
     private var binTask: Task<Void, Never>?
     
     var binCalculator: DynamicBinCalculator
-
+    
     private let updatesClusterContinuation: AsyncStream<[Cluster]>.Continuation
     let updatesStreamCluster: AsyncStream<[Cluster]>
     
@@ -38,13 +39,15 @@ actor TradingEngine {
          strategies: [any TradingStrategy],
          binCalculator: DynamicBinCalculator,
          marketStateAnalyzer: MarketStateAnalyzer,
-         levelStatsManager: LevelStatsManager)
+         levelStatsManager: LevelStatsManager,
+         orderManager: OrderManager)
     {
         self.dataService = dataService
         self.strategies = strategies
         self.binCalculator = binCalculator
         self.marketStateAnalyzer = marketStateAnalyzer
         self.levelStatsManager = levelStatsManager
+        self.orderManager = orderManager
         (self.updatesStreamCluster, self.updatesClusterContinuation) = AsyncStream.makeStream(of: [Cluster].self)
     }
     
@@ -61,7 +64,7 @@ actor TradingEngine {
         let bookStream = await dataService.localOrderBookStream()
         let tradeStream = await dataService.tradeStream()
         
-       
+        
         
         // Задача обновления рыночных данных - минимизируем количество обновлений
         binTask = Task { [weak self] in
@@ -72,7 +75,7 @@ actor TradingEngine {
             }
         }
         
-    
+        
         // Запускаем задачу для распределения сделок по стратегиям
         tradeTask = Task { [weak self] in
             guard let self = self else { return }
@@ -141,7 +144,7 @@ actor TradingEngine {
         await processStrategies(marketSnapshot: marketSnapshot)
     }
     
-
+    
     private func updateMarketData(stream: MarketStateData) async {
         self.currentConfigs = await marketStateAnalyzer.getConfigs()
         self.currentBinAbs = stream.bin.abs
@@ -152,15 +155,19 @@ actor TradingEngine {
     
     
     private func processStrategies(marketSnapshot: MarketSnapshot) async {
-        
-        // 2. Параллельный запуск стратегий
-        await withTaskGroup(of: Void.self) { group in
-            for strategy in strategies {
-                group.addTask {
-                    // Каждая стратегия анализирует рынок в своем потоке
-                    if let signal = await strategy.analyze(marketSnapshot: marketSnapshot) {
-                        print("🟢 СИГНАЛ: \(signal)")
-                    }
+        for strategy in strategies {
+            if let signal = await strategy.analyze(marketSnapshot: marketSnapshot) {
+                
+                // Благодаря enum с данными, обработка превращается в сказку:
+                switch signal {
+                case .buy(_):
+                    await orderManager.openPosition(signal: signal)
+                    
+                case .sell(_):
+                    await orderManager.openPosition(signal: signal)
+                    
+                case .exit(let side):
+                    await orderManager.closePosition(side: side)
                 }
             }
         }

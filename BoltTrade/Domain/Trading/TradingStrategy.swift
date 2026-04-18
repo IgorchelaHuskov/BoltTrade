@@ -16,6 +16,9 @@ protocol TradingStrategy: AnyObject {
 }
 
 
-enum Signal {
-    case buy, sell, exit
+nonisolated enum Signal {
+    case buy(quantity: Double)
+    case sell(quantity: Double)
+    case exit(side: Side) 
 }
+

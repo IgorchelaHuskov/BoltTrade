@@ -12,7 +12,9 @@ import Foundation
 final class StrategyViewModel {
     private(set) var ui: StrategyUIState?
     private(set) var accountInfo: AccountInfo = AccountInfo()
+    private(set) var currentAmountUSDT: Double = 100.0
     
+    private let strategy: BounceStrategy
     private let dataProvider: DataProvider
     private var observationTask: Task<Void, Never>?
     private var balanceTask: Task<Void, Never>?
@@ -26,7 +28,8 @@ final class StrategyViewModel {
     private var lastListenKey: String?
     // ------------------------------------
 
-    init(strategy: BounceStrategy, dataProvider: DataProvider) {
+    init(strategy: BounceStrategy, dataProvider: DataProvider)  {
+        self.strategy = strategy
         self.dataProvider = dataProvider
         
         self.observationTask = Task {
@@ -36,6 +39,10 @@ final class StrategyViewModel {
         }
         
         fetchInitialBalance()
+        
+        Task {
+            await loadCurrentAmount()
+        }
     }
     
     private func fetchInitialBalance() {
@@ -43,13 +50,24 @@ final class StrategyViewModel {
         
         balanceTask = Task {
             do {
-                
                 let listenKey = try await dataProvider.getListenKey()
                 self.lastListenKey = listenKey
                 
                 // Получаем базу через REST (даже если позиций 0)
                 let balances = try await dataProvider.fetchAccountBalance()
                 self.syncBaseData(from: balances) // Сохраняем кошелек и маржу
+                
+                Task {
+                    while !Task.isCancelled {
+                        // Ждем 30 минут
+                        try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+                        
+                        // Продлеваем ключ
+                        if let currentKey = self.lastListenKey {
+                            await self.dataProvider.keepAliveListenKey(key: currentKey)
+                        }
+                    }
+                }
                 
                 await withTaskGroup(of: Void.self) { group in
                     
@@ -80,19 +98,6 @@ final class StrategyViewModel {
                             }
                         } catch { print("Stream цены упал") }
                     }
-                    
-                    group.addTask {
-                        while !Task.isCancelled {
-                            // Ждем 30 минут
-                            try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
-                            
-                            // Продлеваем ключ
-                            if let currentKey = await self.lastListenKey {
-                                await self.dataProvider.keepAliveListenKey(key: currentKey)
-                            }
-                        }
-                    }
-
                 }
             } catch {
                 print("❌ Ошибка: \(error)")
@@ -175,5 +180,20 @@ final class StrategyViewModel {
             pnl: String(format: "%.2f", pnl),
             pnlPercentage: "0.00"
         )
+    }
+    
+    
+    private func loadCurrentAmount() async {
+        let amount = await strategy.getAmountUSDT()
+        self.currentAmountUSDT = amount
+    }
+    
+    func setAmountUSDT(_ newAmount: Double) {
+        Task {
+            await strategy.updateAmountUSDT(newAmount)
+            await MainActor.run {
+                self.currentAmountUSDT = newAmount
+            }
+        }
     }
 }

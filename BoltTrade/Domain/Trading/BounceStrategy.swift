@@ -11,6 +11,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
     // MARK: - Свойства
     private var state: StrategyState = .scanning
     private var tradeHistory: [TradeHistoryItem] = []
+    private var amountUSDT  = 100.0
     
     //MARK: UI
     private let (uiStream, uiContinuation) = AsyncStream<StrategyUIState>.makeStream()
@@ -28,7 +29,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         static let volatilitySpikeRadius            = 0.002     // 0.2%
         static let volatilityConcentrationThreshold = 0.4
         static let maxSpreadPercent                 = 0.001     // 0.1%
-        static let volumeStability                  = 0.9       // Стабильность обьема
+        static let volumeStability                  = 0.6       // Стабильность обьема
         
         // Битва
         static let attackerMinVolume            = 1.0
@@ -43,7 +44,9 @@ actor BounceStrategy: TradingStrategy, Resettable {
         static let stopLossOffsetPercent    = 0.01      // 1%
         static let totalCosts               = 0.0011    // 0.11% (комиссии + спред)
         static let breakEvenActivation      = 0.0015    // 0.2%
-        static let defaultLeverage          = 50        // кредитное плечо
+        
+        // кредитное плече
+        static let defaultLeverage          = 50.0
         
         // Пороги скорости подхода (% в секунду)
         static let mediumVelocityThreshold  = 0.2       // > 0.2%/с - средняя скорость
@@ -83,7 +86,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
         let entryUpperBound: Double
         let sourceClusterStartTime: ContinuousClock.Instant
         let openTime: Date
-        let leverage: Double
         var sourceMonitoringContext: MonitoringContext?   // для исходного кластера
         var encounterMonitoringContext: MonitoringContext? // для встречного
         var processedClusterIds: Set<Double> = []
@@ -94,6 +96,13 @@ actor BounceStrategy: TradingStrategy, Resettable {
         let stopPrice: Double
         let ratio: Double
     }
+    
+    struct OrderAction {
+        let side: Side
+        let entryPrice: Double
+        let stopPrice: Double
+    }
+
     
     enum StrategyState {
         case scanning
@@ -147,6 +156,15 @@ actor BounceStrategy: TradingStrategy, Resettable {
         state = .scanning
     }
     
+    func updateAmountUSDT(_ newAmount: Double) {
+        amountUSDT = newAmount
+        log("💰 Сумма для торговли обновлена: \(amountUSDT) USDT")
+    }
+    
+    func getAmountUSDT() -> Double {
+        return amountUSDT
+    }
+    
     // MARK: - Обработка состояний
     private func handleScanning(snapshot: MarketSnapshot, foundCluster: Cluster?) async -> Signal? {
         guard let targetCluster = foundCluster else { return nil }
@@ -190,7 +208,16 @@ actor BounceStrategy: TradingStrategy, Resettable {
             
             let position = createPosition(from: ctx.cluster, entryPrice: snapshot.currentPrice, context: ctx, stopPrice: rr.stopPrice)
             state = .positionOpen(position)
-            return (ctx.cluster.side == .bid) ? .buy : .sell
+            
+            
+            let quantity = (self.amountUSDT * Constants.defaultLeverage) / snapshot.currentPrice
+            
+            // Возвращаем сигнал со всеми деталями
+            if ctx.cluster.side == .bid {
+                return .buy(quantity: quantity)
+            } else {
+                return .sell(quantity: quantity)
+            }
         }
     }
     
@@ -203,7 +230,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
             let whyClosePosition = logStopLoss(position, price: price)
             addTradeToHistory(entryPosition: position, exitPrice: price, exitDate: Date(), whyClosePosition: whyClosePosition)
             await reset()
-            return .exit
+            return .exit(side: position.side)
         }
         
         // 2. Жесткий Тейк-профит 1%
@@ -222,7 +249,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
             log("💰 [TP 1%] Цель достигнута по цене \(price). Закрываем профит.")
             addTradeToHistory(entryPosition: position, exitPrice: price, exitDate: Date(), whyClosePosition: "Take Profit 1%")
             await reset()
-            return .exit
+            return .exit(side: position.side)
         }
         
         // Ищем защитника (своя сторона)
@@ -252,7 +279,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
                 log("Защитный уровень пробит! Закрываем позицию.")
                 addTradeToHistory(entryPosition: position, exitPrice: price, exitDate: Date(), whyClosePosition: "Защитный уровень пробит!")
                 await reset()
-                return .exit
+                return .exit(side: position.side)
                 
             case .bounceConfirmed:
                 // Уровень отработал, цена ушла в нашу сторону
@@ -330,10 +357,7 @@ actor BounceStrategy: TradingStrategy, Resettable {
         // ========== 4. Стабильность объёма ==========
         let currentVol = currentVolume(for: cluster, in: snapshot.book)
         let stats = snapshot.battleStats[cluster.trackingId]
-        let volStatus = checkVolumeStability(cluster: cluster,
-                                             currentVolume: currentVol,
-                                             initialVolume: context.initialVolume,
-                                             battleStats: stats)
+        let volStatus = checkVolumeStability(cluster: cluster, currentVolume: currentVol,initialVolume: context.initialVolume, battleStats: stats)
         if case .critical = volStatus {
             return .broken("Volume drop")
         }
@@ -704,7 +728,6 @@ actor BounceStrategy: TradingStrategy, Resettable {
                         entryUpperBound: cluster.upperBound,
                         sourceClusterStartTime: context.startTime,
                         openTime: Date(),
-                        leverage: Double(Constants.defaultLeverage),
                         sourceMonitoringContext: context
         )
     }
@@ -901,26 +924,31 @@ actor BounceStrategy: TradingStrategy, Resettable {
             let price = snapshot.currentPrice
             let entry = position.entryPrice
 
-            let rawPnLPercent: Double
+            // 1. Считаем чистое изменение цены (коэффициент)
+            let priceChange: Double
             if position.side == .bid {
-                // LONG: прибыль когда цена выше входа
-                rawPnLPercent = (price - entry) / entry * 100
+                priceChange = (price - entry) / entry
             } else {
-                // SHORT: прибыль когда цена ниже входа
-                rawPnLPercent = (entry - price) / entry * 100
+                priceChange = (entry - price) / entry
             }
 
-            let pnlPercent = rawPnLPercent * position.leverage
-            
+            // 2. Теперь считаем оба значения правильно:
+            // Проценты: коэффициент * 100 * плечо
+            let pnlPercent = priceChange * 100 * Constants.defaultLeverage
+
+            // Деньги: коэффициент * сумма ставки * плечо
+            let pnlAbsolute = priceChange * self.amountUSDT * Constants.defaultLeverage
+
             positionInfo = PositionInfo(
                 side: position.side,
                 entryPrice: position.entryPrice,
                 openTime: position.openTime,
                 pnlPercent: pnlPercent,
-                pnlAbsolute: pnlPercent,
+                pnlAbsolute: pnlAbsolute,
                 sourceCluster: sourceClusterInfo,
                 encounterCluster: encounterClusterInfo
             )
+
             
             message = "Позиция открыта"
         }
@@ -1008,20 +1036,18 @@ actor BounceStrategy: TradingStrategy, Resettable {
     }
     
     private func addTradeToHistory(entryPosition: Position, exitPrice: Double, exitDate: Date, whyClosePosition: String) {
-        let investmentAmount = 100.0 // сумма входа в USDT
-        let leverage = entryPosition.leverage
         
         let pnlAbsolute: Double
         let pnlPercent: Double
         
         if entryPosition.side == .bid {
             // Для LONG: (exitPrice - entryPrice) / entryPrice * investmentAmount * leverage
-            pnlAbsolute = ((exitPrice - entryPosition.entryPrice) / entryPosition.entryPrice) * investmentAmount * leverage
-            pnlPercent = ((exitPrice - entryPosition.entryPrice) / entryPosition.entryPrice) * 100 * leverage
+            pnlAbsolute = ((exitPrice - entryPosition.entryPrice) / entryPosition.entryPrice) * self.amountUSDT * Constants.defaultLeverage
+            pnlPercent = ((exitPrice - entryPosition.entryPrice) / entryPosition.entryPrice) * 100 * Constants.defaultLeverage
         } else {
             // Для SHORT: (entryPrice - exitPrice) / entryPrice * investmentAmount * leverage
-            pnlAbsolute = ((entryPosition.entryPrice - exitPrice) / entryPosition.entryPrice) * investmentAmount * leverage
-            pnlPercent = ((entryPosition.entryPrice - exitPrice) / entryPosition.entryPrice) * 100 * leverage
+            pnlAbsolute = ((entryPosition.entryPrice - exitPrice) / entryPosition.entryPrice) * self.amountUSDT * Constants.defaultLeverage
+            pnlPercent = ((entryPosition.entryPrice - exitPrice) / entryPosition.entryPrice) * 100 * Constants.defaultLeverage
         }
         
         let item = TradeHistoryItem(

@@ -23,7 +23,9 @@ struct ContentView: View {
                 HStack(spacing: 0) {
                     // --- ЛЕВАЯ КОЛОНКА (Аккаунт и История) ---
                     VStack(alignment: .leading, spacing: 25) {
-                        AccountWidget(accountInfo: viewModel.accountInfo)
+                        AccountWidget(accountInfo: viewModel.accountInfo,
+                                      currentAmount: viewModel.currentAmountUSDT,
+                                      onAmountConfirmed: { newAmount in viewModel.setAmountUSDT(newAmount) })
                         
                         VStack(alignment: .leading, spacing: 15) {
                             Text("История входов")

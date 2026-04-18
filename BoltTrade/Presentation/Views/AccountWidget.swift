@@ -10,7 +10,12 @@ import SwiftUI
 
 // MARK: - Виджет аккаунта
 struct AccountWidget: View {
+    @State private var isShowingPopover = false
+    @State private var tempAmount: Double = 0.0
+
     let accountInfo: AccountInfo
+    let currentAmount: Double                   // текущая сумма из стратегии
+    let onAmountConfirmed: (Double) -> Void     // колбэк при подтверждении
     
     let gradientColors = [
         Color(red: 63/255, green: 73/255, blue: 110/255), // Синий
@@ -45,13 +50,67 @@ struct AccountWidget: View {
                 Spacer()
                 
                 // Иконка кошелька
-                VStack(spacing: 4) {
-                    Image(systemName: "wallet.pass.fill")
-                        .font(.system(size: 20))
-                    Text("Pay")
-                        .font(.system(size: 10))
+                Button(action: {
+                    isShowingPopover.toggle()
+                }) {
+                    VStack(spacing: 4) {
+                        Image(systemName: "wallet.pass.fill")
+                            .font(.system(size: 20))
+                        Text("Pay")
+                            .font(.system(size: 10))
+                    }
+                    .padding(4)
+                    .contentShape(Rectangle()) // Чтобы кликалось по всей области
                 }
-                .foregroundColor(.white.opacity(0.9))
+                .buttonStyle(.plain) // Убирает стандартную серую обертку кнопки macOS
+                
+                .popover(isPresented: $isShowingPopover, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Дост. \(accountInfo.available) USDT")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        
+                        Text("Сумма для торговли")
+                            .font(.system(size: 12, weight: .medium))
+                        
+                        HStack {
+                            TextField("", value: $tempAmount, format: .number)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 14, weight: .semibold))
+                            
+                            Divider().frame(height: 14)
+                            
+                            HStack(spacing: 4) {
+                                Text("USDT")
+                                    .fontWeight(.bold)
+                                Image(systemName: "arrowtriangle.down.fill")
+                                    .font(.system(size: 8))
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(4)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.yellow.opacity(0.8), lineWidth: 1)
+                        )
+                        
+                        Button("Подтвердить") {
+                            onAmountConfirmed(tempAmount)
+                            isShowingPopover = false
+                        }
+                        .controlSize(.small)
+                        .keyboardShortcut(.defaultAction)
+                    }
+                    .padding()
+                    .frame(width: 220)
+                    .onAppear {
+                        tempAmount = currentAmount  // инициализируем текущим значением
+                    }
+                }
+                
+                
             }
             
             // Заголовок аккаунта

@@ -19,6 +19,7 @@ final class AppCoordinator {
     private(set) var marketStateAnalyzer: MarketStateAnalyzer!
     private(set) var levelStatsManager: LevelStatsManager!
     private(set) var strategyViewModel: StrategyViewModel?
+    private(set) var orderManager: OrderManager!
     
     private var tasks: [Task<Void, Never>] = []
     
@@ -32,6 +33,7 @@ final class AppCoordinator {
             let wsService = WebSocketService()
             let dataProvider = DataProvider(wsService: wsService)
             let dataService = DataService(dataProvider: dataProvider)
+            let orderManager = OrderManager(dataProvider: dataProvider)
             
             self.historyService = HistoricalCandleService(dataProvider: dataProvider, modelContainer: container)
             self.marketStateAnalyzer = MarketStateAnalyzer(modelContainer: container)
@@ -72,7 +74,7 @@ final class AppCoordinator {
                                                 strategies: [bounce],
                                                 binCalculator: binCalculator,
                                                 marketStateAnalyzer: marketStateAnalyzer,
-                                                levelStatsManager: levelStatsManager)
+                                                levelStatsManager: levelStatsManager, orderManager: orderManager)
     
             self.dataService = dataService
             await withTaskGroup(of: Void.self) { group in

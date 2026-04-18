@@ -102,7 +102,7 @@ actor DataProvider {
     
     
     func fetchCandle(symbol: String = "BTCUSDT",
-                     interval: String = "15m",
+                     interval: String = "1h",
                      limit: Int = 1000,
                      startTime: Int64? = nil,
                      endTime: Int64? = nil) async throws -> [Candle] {
@@ -293,4 +293,58 @@ actor DataProvider {
             }
         }
     }
+    
+    
+    func sendOrder(params: [String: String]) async throws {
+        guard let config = await APIConfig.shared else { throw ApiError.invalidData }
+        
+        var finalParams = params
+        finalParams["timestamp"] = "\(Int(Date().timeIntervalSince1970 * 1000))"
+        finalParams["recvWindow"] = "5000" // Важно для синхронизации времени
+        
+        let queryString = finalParams
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "&")
+        
+        let signature = generateSignature(query: queryString, secret: config.secretKey)
+        let url = URL(string: "\(config.binancefutureURL)/fapi/v1/order")!
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(config.apiKey, forHTTPHeaderField: "X-MBX-APIKEY")
+        request.httpBody = "\(queryString)&signature=\(signature)".data(using: .utf8)
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        // Проверка на ошибки (Binance возвращает код ошибки в JSON)
+        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+            let errorMsg = String(data: data, encoding: .utf8) ?? ""
+            print("❌ Ошибка сервера (\(httpResponse.statusCode)): \(errorMsg)")
+            throw ApiError.invalidData
+        }
+    }
+    
+    
+    func cancelAllOpenOrders(symbol: String) async throws {
+        guard let config = await APIConfig.shared else { throw ApiError.invalidData }
+        
+        let timestamp = "\(Int(Date().timeIntervalSince1970 * 1000))"
+        let queryString = "symbol=\(symbol)&timestamp=\(timestamp)"
+        let signature = generateSignature(query: queryString, secret: config.secretKey)
+        
+        let url = URL(string: "\(config.binancefutureURL)/fapi/v1/allOpenOrders?\(queryString)&signature=\(signature)")!
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue(config.apiKey, forHTTPHeaderField: "X-MBX-APIKEY")
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+            let errorMsg = String(data: data, encoding: .utf8) ?? ""
+            print("❌ Ошибка сервера (\(httpResponse.statusCode)): \(errorMsg)")
+            throw ApiError.invalidData
+        }
+    }
+
 }
